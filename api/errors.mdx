@@ -1,0 +1,152 @@
+---
+title: "Error Types in gbm.rs"
+sidebarTitle: "Errors"
+description: "Reference for gbm.rs error types: InvalidFdError for failed DMA-BUF fd retrieval and FrontBufferError for surface buffer locking failures."
+---
+
+gbm.rs defines two error types for operations that fail without an underlying OS error code. Most failures in the library surface as `std::io::Error` (capturing `errno`), but two specific cases — retrieving a DMA-BUF file descriptor and locking a surface's front buffer — can fail in ways that libgbm signals with a sentinel return value rather than setting `errno`. These two cases get their own dedicated error types.
+
+---
+
+## `InvalidFdError`
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidFdError;
+```
+
+`InvalidFdError` is returned when `libgbm` produces a file descriptor value of `-1`, which signals failure without setting `errno`. It is a unit struct — there is no additional diagnostic information beyond the fact that the fd is invalid.
+
+**Display message:** `"The returned fd is invalid"`
+
+**Returned by:**
+
+| Method | Description |
+|---|---|
+| `BufferObject::fd()` | Get a DMA-BUF (PRIME) fd for the whole buffer object. |
+| `BufferObject::fd_for_plane(plane: i32)` | Get a DMA-BUF fd for a specific plane of a planar buffer. |
+
+Both methods return `Result<OwnedFd, InvalidFdError>`. On success the caller receives an `OwnedFd` and is responsible for closing it (which happens automatically when the `OwnedFd` is dropped). Each call to these methods returns a **new** file descriptor — calling them repeatedly creates multiple independent fds that all refer to the same underlying buffer.
+
+#### Example
+
+```rust
+use gbm::InvalidFdError;
+
+match bo.fd() {
+    Ok(owned_fd) => {
+        // owned_fd is a valid DMA-BUF file descriptor.
+        // Pass it to another process, to Vulkan, or to EGL.
+        println!("DMA-BUF fd: {}", owned_fd.as_raw_fd());
+        // owned_fd closes automatically when it goes out of scope.
+    }
+    Err(InvalidFdError) => {
+        // libgbm returned -1. The buffer may not have been created
+        // with a format/usage combination that supports PRIME export,
+        // or the kernel driver does not support DMA-BUF on this buffer.
+        eprintln!("Failed to export DMA-BUF fd: {InvalidFdError}");
+    }
+}
+
+// Planar buffers (e.g. NV12) export per-plane fds.
+for plane in 0..bo.plane_count() as i32 {
+    match bo.fd_for_plane(plane) {
+        Ok(fd) => println!("  plane {plane} fd: {}", fd.as_raw_fd()),
+        Err(InvalidFdError) => eprintln!("  plane {plane}: invalid fd"),
+    }
+}
+```
+
+---
+
+## `FrontBufferError`
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontBufferError;
+```
+
+`FrontBufferError` is returned when `Surface::lock_front_buffer` fails to lock the surface's front buffer. `libgbm` returns a null pointer in this case, with no further diagnostic information available, so this is also a unit struct.
+
+**Display message:** `"Unknown error"`
+
+**Returned by:**
+
+| Method | Description |
+|---|---|
+| `Surface::lock_front_buffer()` | Lock the front buffer after `eglSwapBuffers`. |
+
+Common causes include: calling `lock_front_buffer` before any `eglSwapBuffers` on the surface, or calling it more than once after a single swap without first releasing the previously locked buffer. Both situations are safety violations — see the [Surface reference](/api/surface) for the correct protocol.
+
+<Warning>
+`Surface::lock_front_buffer` is an `unsafe fn`. Receiving `FrontBufferError` at runtime is not a substitute for upholding the safety invariants. The behavior of calling it incorrectly is undefined, regardless of what the return value happens to be.
+</Warning>
+
+#### Example
+
+```rust
+use gbm::FrontBufferError;
+
+// SAFETY: eglSwapBuffers was called exactly once since the last lock.
+match unsafe { surface.lock_front_buffer() } {
+    Ok(bo) => {
+        // bo is a BufferObject holding the rendered front buffer.
+        // Create a DRM framebuffer from it and schedule a page flip.
+        let fb = drm.add_framebuffer(&bo, 32, 32)?;
+        drm.page_flip(crtc, fb, PageFlipFlags::EVENT, None)?;
+        // Keep `bo` alive until the page flip completes, then drop it.
+    }
+    Err(FrontBufferError) => {
+        // libgbm returned null. Check that:
+        //   1. eglSwapBuffers was called before this.
+        //   2. The previous BufferObject (if any) has been dropped.
+        eprintln!("Failed to lock front buffer: {FrontBufferError}");
+    }
+}
+```
+
+---
+
+## `IoResult` and `std::io::Error`
+
+Most `Device` and `BufferObject` methods return `std::io::Result<T>` (a type alias for `Result<T, std::io::Error>`). On failure, gbm.rs constructs the error with `IoError::last_os_error()`, which captures the current value of `errno` immediately after the failed libgbm call. This means the full POSIX error code is available for inspection and display.
+
+**Methods returning `IoResult`** include (non-exhaustive):
+
+| Method | Failure condition |
+|---|---|
+| `Device::new(fd)` | `gbm_create_device` returned null. |
+| `Device::create_surface(…)` | `gbm_surface_create` returned null. |
+| `Device::create_buffer_object(…)` | `gbm_bo_create` returned null. |
+| `BufferObject::write(&[u8])` | `gbm_bo_write` returned non-zero. |
+| `BufferObject::map(…)` | `gbm_bo_map` returned null. |
+
+#### Example
+
+```rust
+use std::io;
+
+match device.create_buffer_object::<()>(
+    1920,
+    1080,
+    gbm::Format::Xrgb8888,
+    gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
+) {
+    Ok(bo) => println!("Allocated {}x{} buffer.", bo.width(), bo.height()),
+    Err(e) => {
+        // Print the human-readable OS error message.
+        eprintln!("Buffer allocation failed: {e}");
+
+        // Inspect the raw errno value for programmatic handling.
+        if let Some(code) = e.raw_os_error() {
+            match code {
+                libc::ENOMEM => eprintln!("Out of memory (ENOMEM)."),
+                libc::EINVAL => eprintln!("Invalid argument (EINVAL): check format/flags."),
+                other        => eprintln!("OS error code: {other}"),
+            }
+        }
+    }
+}
+```
+
+The `std::io::Error` type also implements `std::error::Error`, so it composes naturally with error-handling crates such as `anyhow` and `thiserror`.

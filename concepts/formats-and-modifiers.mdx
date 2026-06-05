@@ -1,0 +1,169 @@
+---
+title: "Pixel Formats and DRM Modifiers in gbm.rs"
+sidebarTitle: "Formats & Modifiers"
+description: "gbm.rs uses DRM FourCC pixel formats and format modifiers to describe buffer layout. Learn which formats to use for scanout, rendering, and multi-plane buffers."
+---
+
+gbm.rs re-exports two types from the [`drm-fourcc`](https://crates.io/crates/drm-fourcc) crate that describe how pixel data is stored in a `BufferObject` or `Surface`: `Format` (an alias for `DrmFourcc`) and `Modifier` (an alias for `DrmModifier`). Every allocation API in gbm.rs requires a `Format`, and the modifier-based APIs additionally accept a list of `Modifier` values to negotiate the optimal buffer layout with the GPU driver.
+
+## FourCC Pixel Formats
+
+A FourCC ("four character code") format encodes the pixel layout — channel order, bit depth, and planar structure — in a four-byte integer. The DRM subsystem standardises these codes so that GPU drivers, display controllers, media hardware, and user-space APIs can describe the same layouts without ambiguity.
+
+gbm.rs exposes the full set of FourCC codes defined by the DRM specification through the re-exported `Format` enum. You select a format at allocation time and inspect it later via `BufferObject::format()`.
+
+### Common Formats
+
+| Format | Channels | Use Case |
+|---|---|---|
+| `Format::Xrgb8888` | 8-bit R, G, B + 8-bit padding | Primary display scanout; the X channel is ignored by the display. |
+| `Format::Argb8888` | 8-bit A, R, G, B | Compositing and rendering when alpha blending is required. |
+| `Format::Xbgr8888` | 8-bit B, G, R + 8-bit padding | OpenGL default byte order; common for render targets. |
+| `Format::Rgb565` | 5-bit R, 6-bit G, 5-bit B | Embedded and mobile panels; smaller footprint. |
+| `Format::Nv12` | 8-bit Y plane + interleaved UV plane | Hardware video decode output; two-plane YCbCr 4:2:0. |
+| `Format::Yuyv` | Packed 4:2:2 YCbCr | Camera capture, video overlay. |
+
+<Note>
+  Not every format is supported for every use case. Always call
+  `Device::is_format_supported(format, flags)` before allocating a buffer
+  with a format/usage combination you have not verified for the target hardware.
+</Note>
+
+## DRM Format Modifiers
+
+A format modifier extends a FourCC code with additional information about the buffer's **memory layout** — particularly tiling and compression schemes. The same pixel format can exist in many physical arrangements: linear row-major order, GPU-specific tile patterns, vendor lossless compression, and so on. Display scanout engines often require a specific layout, and GPUs render fastest in their native tiled format.
+
+Modifiers are 64-bit values defined by DRM and the GPU vendors. The most important ones are:
+
+| Modifier | Meaning |
+|---|---|
+| `Modifier::Linear` | Rows are stored sequentially with no tiling. Portable; useful for CPU access and cross-device import. |
+| `Modifier::Invalid` | No modifier is known or applicable. Returned by `BufferObject::modifier()` for some single-plane allocations where the layout is driver-controlled. |
+| Vendor-specific values | e.g. Intel X-tiling, AMD display tiling, ARM AFBC. Obtained via EGL modifier negotiation. |
+
+### Checking Plane Counts
+
+Multi-plane formats (like `Nv12`) with specific modifiers may require a fixed number of planes. Use `Device::format_modifier_plane_count` to determine this before allocating:
+
+```rust
+use gbm::{Device, Format, Modifier};
+use std::fs::File;
+
+let file = File::options().read(true).write(true).open("/dev/dri/card0")?;
+let gbm = Device::new(file)?;
+
+match gbm.format_modifier_plane_count(Format::Nv12, Modifier::Linear) {
+    Some(n) => println!("NV12 + Linear requires {} plane(s)", n),
+    None    => println!("Plane count is not fixed for this combination"),
+}
+```
+
+<Note>
+  `format_modifier_plane_count` returns `None` for modifier combinations that
+  do not have a fixed, defined plane count — most commonly when
+  `Modifier::Invalid` is passed. This does not mean the allocation will fail;
+  it means the driver determines the layout internally.
+</Note>
+
+## Checking Format Support Before Allocation
+
+`Device::is_format_supported(format, usage)` is the right place to start when you are not certain a format/usage combination is available on the target GPU. This is especially important for scanout buffers, where the display controller has stricter requirements than the render engine.
+
+```rust
+use gbm::{Format, BufferObjectFlags};
+
+let pairs = [
+    (Format::Xrgb8888, BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING),
+    (Format::Argb8888, BufferObjectFlags::RENDERING),
+    (Format::Nv12,     BufferObjectFlags::SCANOUT),
+];
+
+for (format, flags) in pairs {
+    if gbm.is_format_supported(format, flags) {
+        println!("{:?} with {:?} — supported", format, flags);
+    } else {
+        println!("{:?} with {:?} — NOT supported", format, flags);
+    }
+}
+```
+
+## Allocating with Explicit Modifiers
+
+When you have negotiated a list of acceptable modifiers with EGL (via `EGL_EXT_image_dma_buf_import_modifiers` or similar), pass them to the modifier-aware creation methods. The driver selects the first modifier it can accommodate.
+
+```rust
+use gbm::{Format, Modifier, BufferObjectFlags};
+
+// Modifiers negotiated with EGL or a Vulkan driver
+let negotiated_modifiers: Vec<Modifier> = vec![
+    // vendor-specific tiling modifier (illustrative value)
+    Modifier::from(0x0100_0000_0000_0002_u64),
+    Modifier::Linear, // fallback
+];
+
+// Check support and allocate
+if gbm.is_format_supported(Format::Xrgb8888, BufferObjectFlags::SCANOUT) {
+    let bo = gbm.create_buffer_object_with_modifiers2::<()>(
+        1920,
+        1080,
+        Format::Xrgb8888,
+        negotiated_modifiers.iter().copied(),
+        BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+    )?;
+
+    println!("Allocated with modifier: {:?}", bo.modifier());
+    println!("Plane count: {}", bo.plane_count());
+}
+```
+
+Similarly, `Device::create_surface_with_modifiers` and `create_surface_with_modifiers2` accept an iterator of modifiers for EGL surface creation:
+
+```rust
+let surface = gbm.create_surface_with_modifiers2::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    negotiated_modifiers.iter().copied(),
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+## Inspecting a Buffer's Modifier
+
+After allocation, read back the actual modifier the driver selected with `BufferObject::modifier()`. You must communicate this modifier to any API that will import the buffer (EGL, Vulkan, another DRM device) so they interpret the memory layout correctly.
+
+```rust
+let modifier: Modifier = bo.modifier();
+
+match modifier {
+    Modifier::Linear => println!("Linear layout — safe for CPU access"),
+    Modifier::Invalid => println!("Modifier unknown — driver-managed layout"),
+    other => println!("Vendor modifier: {:#018x}", u64::from(other)),
+}
+```
+
+## Summary: Format and Modifier Decision Guide
+
+<CardGroup cols={2}>
+  <Card title="Scanout buffers" icon="display">
+    Use `Format::Xrgb8888` (or the panel's native format). Pass
+    `BufferObjectFlags::SCANOUT`. Call `is_format_supported` first.
+    Negotiate modifiers with EGL or the display driver.
+  </Card>
+  <Card title="Render targets" icon="paintbrush">
+    Use `Format::Argb8888` or `Format::Xbgr8888` (OpenGL default). Pass
+    `BufferObjectFlags::RENDERING`. Let the driver choose the modifier
+    unless you need cross-device sharing.
+  </Card>
+  <Card title="Video buffers" icon="film">
+    Use `Format::Nv12` or `Format::Yuyv`. These are multi-plane; inspect
+    `plane_count()`, `stride_for_plane()`, and `offset()` to locate
+    each plane.
+  </Card>
+  <Card title="CPU-writable buffers" icon="microchip">
+    Use `Modifier::Linear` to guarantee row-major layout. Pass
+    `BufferObjectFlags::LINEAR` or include `Modifier::Linear` in the
+    modifiers list to force it. Combine with `BufferObjectFlags::WRITE`
+    if you need `BufferObject::write()`.
+  </Card>
+</CardGroup>

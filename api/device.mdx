@@ -1,0 +1,128 @@
+---
+title: "Device<T> - GBM Device Type Reference"
+sidebarTitle: "Device"
+description: "API reference for Device<T>, the root type in gbm.rs. Wraps a DRM file descriptor to provide buffer allocation, surface creation, and buffer import methods."
+---
+
+`Device<T>` is the entry point for all gbm.rs operations. It wraps an open DRM file descriptor and owns the lifetime of the underlying `gbm_device`, providing methods to allocate buffer objects, create rendering surfaces, and import foreign buffers from Wayland, EGL, and DMA-BUF sources. Every other type in gbm.rs — `BufferObject<U>` and `Surface<U>` — is produced through a `Device<T>`.
+
+## Struct Definition
+
+```rust
+pub struct Device<T: AsFd>
+```
+
+`Device<T>` is generic over any type `T` that implements [`AsFd`](https://doc.rust-lang.org/std/os/unix/io/trait.AsFd.html), so it composes cleanly with `std::fs::File`, `std::os::unix::io::OwnedFd`, or any custom wrapper around a DRM file descriptor.
+
+## Constructor
+
+### `Device::new`
+
+```rust
+pub fn new(fd: T) -> IoResult<Device<T>>
+```
+
+Opens a GBM device from an already-open DRM file descriptor. Internally calls `gbm_create_device(fd)` and returns `Err(IoError::last_os_error())` if the C function returns a null pointer. On success, the device takes ownership of `fd` and schedules `gbm_device_destroy` to run when the last reference is dropped.
+
+The file descriptor is typically obtained by opening a DRM node such as `/dev/dri/card0` or `/dev/dri/renderD128`.
+
+```rust
+use std::fs::File;
+use std::os::unix::io::OwnedFd;
+use gbm::Device;
+
+// Using File
+let file = File::options().read(true).write(true).open("/dev/dri/card0")?;
+let device: Device<File> = Device::new(file)?;
+
+// Using OwnedFd
+let owned: OwnedFd = File::options()
+    .read(true)
+    .write(true)
+    .open("/dev/dri/card0")?
+    .into();
+let device: Device<OwnedFd> = Device::new(owned)?;
+```
+
+<ParamField path="fd" type="T: AsFd" required>
+  An open DRM device file descriptor. The GBM backend uses this descriptor to
+  communicate with the kernel for memory allocation. For DRI-based drivers this
+  is typically a node under `/dev/dri/`.
+</ParamField>
+
+**Returns:** `IoResult<Device<T>>` — `Ok(device)` on success, or `Err` carrying the OS errno set by `gbm_create_device`.
+
+## Type Examples
+
+| Type | Use case |
+|---|---|
+| `Device<File>` | Simple ownership via `std::fs::File`; implements `Clone` when `File: Clone`. |
+| `Device<OwnedFd>` | Idiomatic file-descriptor ownership in modern Rust; safe to move across threads. |
+
+## Trait Implementations
+
+### `Clone` *(where T: Clone)*
+
+Cloning a `Device<T>` does **not** open a second `gbm_device`. The inner raw pointer is wrapped in an `Arc`-backed `Ptr<gbm_device>`, so cloning increments the reference count and both handles share the same underlying device. The device is destroyed only when every clone is dropped.
+
+```rust
+let device2 = device.clone(); // shares the same gbm_device
+```
+
+### `Debug`
+
+Formats as `Device { ptr: 0x… }`, printing the pointer address of the underlying `gbm_device`. Useful for logging without exposing the file descriptor.
+
+### `AsFd`
+
+```rust
+impl<T: AsFd> AsFd for Device<T>
+```
+
+Returns a `BorrowedFd` backed by the raw file descriptor obtained from `gbm_device_get_fd`. This ensures the fd surfaced through `AsFd` is always the one the GBM driver is using, even if the original wrapper type normalises or remaps descriptors.
+
+### `AsRaw<gbm_device>`
+
+```rust
+impl<T: AsFd> AsRaw<ffi::gbm_device> for Device<T>
+```
+
+Provides a raw `*const gbm_device` for FFI calls that need to drop below gbm.rs's safe abstraction layer.
+
+### `Deref<Target = T>` / `DerefMut`
+
+```rust
+impl<T: AsFd> Deref for Device<T> { type Target = T; }
+impl<T: AsFd> DerefMut for Device<T>
+```
+
+Deref-coerces to the underlying `T`, so methods on the wrapped file descriptor (for example DRM ioctls via `drm-rs`) are accessible directly on `Device<T>` without explicitly extracting the inner value.
+
+### `Send` + `Sync`
+
+`Device<T>` is unconditionally `Send` and `Sync`. The underlying `gbm_device` is thread-safe, and shared ownership is managed through an atomic `Arc`.
+
+### `drm::Device` and `drm::control::Device` *(drm-support feature)*
+
+```rust
+#[cfg(feature = "drm-support")]
+impl<T: DrmDevice + AsFd> drm::Device for Device<T> {}
+
+#[cfg(feature = "drm-support")]
+impl<T: DrmControlDevice + AsFd> drm::control::Device for Device<T> {}
+```
+
+When the `drm-support` Cargo feature is enabled and the wrapped `T` implements the drm-rs device traits, `Device<T>` forwards those trait implementations automatically. This lets you call drm-rs modesetting APIs — `add_framebuffer`, `set_crtc`, etc. — directly on the `Device<T>`.
+
+<Note>
+  Enable the `drm-support` feature in `Cargo.toml` to unlock DRM/KMS integration:
+
+  ```toml
+  [dependencies]
+  gbm = { version = "...", features = ["drm-support"] }
+  ```
+</Note>
+
+## Full Method Reference
+
+For a complete listing of every method on `Device<T>` — including buffer object creation, surface allocation, and foreign buffer import — see [Device Methods](/api/device-methods).

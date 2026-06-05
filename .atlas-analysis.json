@@ -1,0 +1,146 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "gbm.rs",
+  "projectDescription": "Safe Rust bindings for libgbm (Generic Buffer Manager), enabling portable GPU buffer allocation for DRM/KMS, Wayland, and EGL display pipelines.",
+  "theme": "luma",
+  "primaryColor": "#624c3e",
+  "lightColor": "#c1ac9b",
+  "darkColor": "#040404",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/gbm-overview",
+              "concepts/device",
+              "concepts/buffer-objects",
+              "concepts/surfaces",
+              "concepts/formats-and-modifiers"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/drm-integration",
+              "guides/wayland-import",
+              "guides/egl-rendering",
+              "guides/dma-buf-import"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/cargo-features",
+              "configuration/bindgen"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Device",
+            "pages": [
+              "api/device",
+              "api/device-methods"
+            ]
+          },
+          {
+            "group": "Buffer Object",
+            "pages": [
+              "api/buffer-object",
+              "api/buffer-object-flags",
+              "api/mapped-buffer-object"
+            ]
+          },
+          {
+            "group": "Surface",
+            "pages": [
+              "api/surface"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types",
+              "api/errors"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Safe, idiomatic Rust wrappers around the libgbm C library",
+    "Reference-counted Device, BufferObject, and Surface types with automatic lifetime management",
+    "Buffer import from Wayland buffers, EGL images, and DMA-BUF file descriptors",
+    "Optional integration with drm-rs for direct KMS/DRM framebuffer operations",
+    "Support for format modifiers (tiling, compression) via explicit modifier APIs",
+    "CPU-accessible buffer mapping with read and read/write transfer modes",
+    "Serde serialization support for BufferObjectFlags via optional feature flag",
+    "Thread-safe (Send + Sync) types backed by atomic reference counting"
+  ],
+  "publicApiSurface": [
+    "Device<T>",
+    "Device::new(fd: T) -> IoResult<Device<T>>",
+    "Device::backend_name(&self) -> &str",
+    "Device::is_format_supported(&self, format: Format, usage: BufferObjectFlags) -> bool",
+    "Device::format_modifier_plane_count(&self, format: Format, modifier: Modifier) -> Option<u32>",
+    "Device::create_buffer_object<U>(&self, width, height, format, usage) -> IoResult<BufferObject<U>>",
+    "Device::create_buffer_object_with_modifiers<U>(&self, width, height, format, modifiers) -> IoResult<BufferObject<U>>",
+    "Device::create_buffer_object_with_modifiers2<U>(&self, width, height, format, modifiers, usage) -> IoResult<BufferObject<U>>",
+    "Device::create_surface<U>(&self, width, height, format, usage) -> IoResult<Surface<U>>",
+    "Device::create_surface_with_modifiers<U>(&self, width, height, format, modifiers) -> IoResult<Surface<U>>",
+    "Device::create_surface_with_modifiers2<U>(&self, width, height, format, modifiers, usage) -> IoResult<Surface<U>>",
+    "Device::import_buffer_object_from_wayland<U>(&self, buffer: &WlBuffer, usage) -> IoResult<BufferObject<U>>",
+    "Device::import_buffer_object_from_egl<U>(&self, buffer: EGLImage, usage) -> IoResult<BufferObject<U>>",
+    "Device::import_buffer_object_from_dma_buf<U>(&self, buffer: BorrowedFd, width, height, stride, format, usage) -> IoResult<BufferObject<U>>",
+    "Device::import_buffer_object_from_dma_buf_with_modifiers<U>(&self, ...) -> IoResult<BufferObject<U>>",
+    "BufferObject<T>",
+    "BufferObject::width(&self) -> u32",
+    "BufferObject::height(&self) -> u32",
+    "BufferObject::stride(&self) -> u32",
+    "BufferObject::stride_for_plane(&self, plane: i32) -> u32",
+    "BufferObject::format(&self) -> Format",
+    "BufferObject::bpp(&self) -> u32",
+    "BufferObject::offset(&self, plane: i32) -> u32",
+    "BufferObject::plane_count(&self) -> u32",
+    "BufferObject::modifier(&self) -> Modifier",
+    "BufferObject::fd(&self) -> Result<OwnedFd, InvalidFdError>",
+    "BufferObject::fd_for_plane(&self, plane: i32) -> Result<OwnedFd, InvalidFdError>",
+    "BufferObject::handle(&self) -> BufferObjectHandle",
+    "BufferObject::handle_for_plane(&self, plane: i32) -> BufferObjectHandle",
+    "BufferObject::device_fd(&self) -> BorrowedFd",
+    "BufferObject::map(&self, x, y, width, height, f) -> IoResult<S>",
+    "BufferObject::map_mut(&mut self, x, y, width, height, f) -> IoResult<S>",
+    "BufferObject::write(&mut self, buffer: &[u8]) -> IoResult<()>",
+    "BufferObject::set_userdata(&mut self, userdata: T) -> Option<T>",
+    "BufferObject::userdata(&self) -> Option<&T>",
+    "BufferObject::userdata_mut(&mut self) -> Option<&mut T>",
+    "BufferObject::take_userdata(&mut self) -> Option<T>",
+    "BufferObject::clear_userdata(&mut self)",
+    "BufferObjectFlags (bitflags: SCANOUT, CURSOR, RENDERING, WRITE, LINEAR, PROTECTED)",
+    "MappedBufferObject<'a, T>",
+    "Surface<T>",
+    "Surface::has_free_buffers(&self) -> bool",
+    "Surface::lock_front_buffer(&self) -> Result<BufferObject<T>, FrontBufferError>",
+    "AsRaw<T> trait",
+    "Format (re-export of drm_fourcc::DrmFourcc)",
+    "Modifier (re-export of drm_fourcc::DrmModifier)",
+    "InvalidFdError",
+    "FrontBufferError",
+    "EGLImage (type alias, import-egl feature)"
+  ]
+}

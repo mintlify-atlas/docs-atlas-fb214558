@@ -1,0 +1,141 @@
+---
+title: "Integrate gbm.rs with drm-rs for KMS Display Output"
+sidebarTitle: "DRM Integration"
+description: "Learn how to combine gbm.rs and drm-rs to allocate GBM buffers, create DRM framebuffers, and drive display output through the kernel's KMS interface."
+---
+
+gbm.rs and drm-rs are designed to work together as a complete, safe Rust stack for Kernel Mode Setting (KMS) display output. GBM acts as the buffer allocator, producing `BufferObject` handles that the DRM kernel interface can directly consume as scanout framebuffers. With the `drm-support` feature enabled, the two crates share types seamlessly: `Device<T>` automatically gains `drm::Device` and `drm::control::Device` implementations, and `BufferObject<T>` satisfies the `drm::buffer::Buffer` and `drm::buffer::PlanarBuffer` traits required by drm-rs APIs.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="drm-support feature" icon="toggle-on">
+    Enable the `drm-support` feature flag in your `Cargo.toml`. It is on by default.
+  </Card>
+  <Card title="DRM device access" icon="microchip">
+    A readable and writable DRM device node, typically `/dev/dri/card0`, opened before creating a GBM device.
+  </Card>
+</CardGroup>
+
+## Setup
+
+### Cargo.toml
+
+```toml
+[dependencies]
+gbm = { version = "0.18", features = ["drm-support"] }
+drm = "0.14"
+```
+
+## Implementation
+
+<Steps>
+  <Step title="Implement a DRM Device Wrapper">
+    Create a minimal `Card` newtype that wraps a `File` and satisfies the drm-rs traits. `Device<T>` requires `T: AsFd`, and the blanket implementations in gbm.rs will propagate `drm::Device` and `drm::control::Device` automatically when your inner type does too.
+
+    ```rust
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::io::{AsFd, BorrowedFd};
+
+    use drm::Device as BasicDevice;
+    use drm::control::Device as ControlDevice;
+
+    struct Card(File);
+
+    impl AsFd for Card {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+
+    // Blanket implementations — no method bodies needed.
+    impl BasicDevice for Card {}
+    impl ControlDevice for Card {}
+
+    fn open_card() -> Card {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/card0")
+            .expect("failed to open DRM device");
+        Card(file)
+    }
+    ```
+  </Step>
+
+  <Step title="Create a GBM Device">
+    Wrap the `Card` in a `gbm::Device`. The GBM device borrows the underlying file descriptor from the inner type via `AsFd`, so the `Card` is moved in and can still be reached through `Deref`.
+
+    ```rust
+    use gbm::Device;
+
+    let card = open_card();
+    let gbm = Device::new(card).expect("failed to create GBM device");
+
+    println!("GBM backend: {}", gbm.backend_name());
+    ```
+  </Step>
+
+  <Step title="Allocate a Scanout Buffer">
+    Allocate a `BufferObject` with the `SCANOUT` usage flag so the kernel knows it will be presented to the display. `Format::Xrgb8888` is the most widely supported scanout format for opaque framebuffers.
+
+    ```rust
+    use gbm::{BufferObjectFlags, Format};
+
+    let mut bo = gbm
+        .create_buffer_object::<()>(
+            1920,
+            1080,
+            Format::Xrgb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
+        )
+        .expect("failed to create buffer object");
+    ```
+  </Step>
+
+  <Step title="Create a DRM Framebuffer">
+    Pass the `BufferObject` directly to `add_framebuffer`. Because `BufferObject<T>` implements `drm::buffer::Buffer` when `drm-support` is enabled, drm-rs can read the size, pitch, format, and GEM handle from it without any manual extraction.
+
+    ```rust
+    use drm::control::Device as ControlDevice;
+
+    // The third and fourth arguments are depth and bpp (bits-per-pixel).
+    let fb = gbm
+        .add_framebuffer(&bo, 24, 32)
+        .expect("failed to add framebuffer");
+    ```
+  </Step>
+
+  <Step title="Configure the Display with set_crtc">
+    Query resource handles to find an active connector and a CRTC, then drive the display by calling `set_crtc`. The framebuffer handle returned in the previous step is passed here.
+
+    ```rust
+    use drm::control::{connector, crtc};
+    use drm::control::Device as ControlDevice;
+
+    let res = gbm.resource_handles().expect("failed to get resource handles");
+
+    // Pick the first available connector and CRTC for brevity.
+    let con_handle = *res.connectors().iter().next().expect("no connectors found");
+    let crtc_handle = *res.crtcs().iter().next().expect("no CRTCs found");
+
+    let connector_info = gbm
+        .get_connector(con_handle, false)
+        .expect("failed to get connector info");
+
+    // Use the connector's preferred (first) mode.
+    let mode = connector_info.modes()[0];
+
+    gbm.set_crtc(crtc_handle, Some(fb), (0, 0), &[con_handle], Some(mode))
+        .expect("failed to set CRTC");
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  When the `drm-support` feature is active, `BufferObject<T>` implements both `drm::buffer::Buffer` and `drm::buffer::PlanarBuffer`. This means you can pass a `BufferObject` directly to any drm-rs API that accepts those traits — including `add_framebuffer`, `add_planar_framebuffer`, and page-flip helpers — without manually extracting GEM handles, strides, or offsets.
+</Note>
+
+<Tip>
+  To render GPU content into the buffer before scanning it out, use an EGL surface backed by GBM instead of writing raw pixel data. See the [EGL Rendering guide](/guides/egl-rendering) for the full rendering loop.
+</Tip>

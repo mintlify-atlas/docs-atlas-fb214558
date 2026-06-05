@@ -1,0 +1,504 @@
+---
+title: "BufferObject<T> - GPU Buffer Handle Reference"
+sidebarTitle: "BufferObject"
+description: "API reference for BufferObject<T> in gbm.rs: inspect dimensions, format, and modifier; map regions for CPU access; export DMA-BUF descriptors; and attach typed userdata."
+---
+
+`BufferObject<T>` represents a GPU-allocated buffer managed by libgbm. It is the central handle type in gbm.rs, wrapping a `gbm_bo` pointer and keeping the parent `gbm_device` alive for as long as the buffer exists. The type parameter `T` lets you attach arbitrary typed data to the buffer object, which libgbm stores and returns on demand. Buffer objects are created through [`Device::create_buffer_object`](/api/device) and are automatically destroyed when the last reference is dropped.
+
+## Struct Definition
+
+```rust
+pub struct BufferObject<T: 'static>
+```
+
+The internal `ffi` pointer is dropped before the `_device` pointer, ensuring the device always outlives any buffer it owns.
+
+## Trait Implementations
+
+| Trait | Notes |
+|---|---|
+| `Debug` | Prints pointer address, dimensions, format, modifier, and plane offsets. |
+| `AsRaw<gbm_bo>` | Returns a raw `*const gbm_bo` for FFI interop. |
+| `Send` | Safe to send across threads; the underlying libgbm types are thread-safe. |
+| `Sync` | Safe to share references across threads. |
+| `drm::buffer::Buffer` *(drm-support)* | Exposes size, format, pitch, and GEM handle for DRM framebuffer operations. |
+| `drm::buffer::PlanarBuffer` *(drm-support)* | Extends `Buffer` with per-plane pitches, handles, offsets, and modifier. |
+
+---
+
+## Geometry and Format
+
+These methods query the dimensions, pixel format, and memory layout reported by the GBM backend at allocation time.
+
+### `width`
+
+```rust
+pub fn width(&self) -> u32
+```
+
+Returns the width of the buffer in pixels.
+
+```rust
+let w = bo.width();
+println!("buffer width: {w}px");
+```
+
+### `height`
+
+```rust
+pub fn height(&self) -> u32
+```
+
+Returns the height of the buffer in pixels.
+
+```rust
+let h = bo.height();
+println!("buffer height: {h}px");
+```
+
+### `stride`
+
+```rust
+pub fn stride(&self) -> u32
+```
+
+Returns the stride (row pitch) of plane 0 in bytes. The stride may be larger than `width * bytes_per_pixel` due to hardware alignment requirements.
+
+```rust
+let stride = bo.stride();
+println!("plane 0 stride: {stride} bytes/row");
+```
+
+### `stride_for_plane`
+
+```rust
+pub fn stride_for_plane(&self, plane: i32) -> u32
+```
+
+Returns the stride in bytes for the given plane index. Useful for multi-planar formats such as `NV12` or `YUV420`.
+
+<ParamField path="plane" type="i32" required>
+  Zero-based plane index. Must be less than `plane_count()`.
+</ParamField>
+
+```rust
+// Inspect strides for a two-plane NV12 buffer
+let y_stride  = bo.stride_for_plane(0);
+let uv_stride = bo.stride_for_plane(1);
+println!("Y stride: {y_stride}, UV stride: {uv_stride}");
+```
+
+### `format`
+
+```rust
+pub fn format(&self) -> Format
+```
+
+Returns the pixel format as a [`drm_fourcc::DrmFourcc`](https://docs.rs/drm-fourcc/latest/drm_fourcc/enum.DrmFourcc.html) value (re-exported as `Format`). Panics if libgbm returns an unrecognised format code.
+
+```rust
+use gbm::Format;
+
+let fmt = bo.format();
+assert_eq!(fmt, Format::Argb8888);
+```
+
+### `bpp`
+
+```rust
+pub fn bpp(&self) -> u32
+```
+
+Returns the bits per pixel for the buffer's format.
+
+```rust
+let bits = bo.bpp();
+println!("bits per pixel: {bits}");
+```
+
+### `offset`
+
+```rust
+pub fn offset(&self, plane: i32) -> u32
+```
+
+Returns the byte offset of the given plane within the buffer's memory allocation.
+
+<ParamField path="plane" type="i32" required>
+  Zero-based plane index.
+</ParamField>
+
+```rust
+let plane0_offset = bo.offset(0);
+println!("plane 0 starts at byte {plane0_offset}");
+```
+
+### `plane_count`
+
+```rust
+pub fn plane_count(&self) -> u32
+```
+
+Returns the number of planes in the buffer. Packed formats like `ARGB8888` have one plane; YUV formats may have two or three.
+
+```rust
+println!("planes: {}", bo.plane_count());
+```
+
+### `modifier`
+
+```rust
+pub fn modifier(&self) -> Modifier
+```
+
+Returns the tiling or compression modifier as a [`drm_fourcc::DrmModifier`](https://docs.rs/drm-fourcc/latest/drm_fourcc/enum.DrmModifier.html) value (re-exported as `Modifier`). `Modifier::Invalid` indicates that no explicit modifier was requested.
+
+```rust
+use gbm::Modifier;
+
+let m = bo.modifier();
+println!("modifier: {m:?}");
+if m == Modifier::Linear {
+    println!("buffer is stored in linear layout");
+}
+```
+
+**Full geometry example**
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let bo = device
+    .create_buffer_object::<()>(1920, 1080, Format::Xrgb8888, BufferObjectFlags::RENDERING)
+    .unwrap();
+
+println!(
+    "{}x{} px, fmt={:?}, modifier={:?}, stride={} B, planes={}",
+    bo.width(),
+    bo.height(),
+    bo.format(),
+    bo.modifier(),
+    bo.stride(),
+    bo.plane_count(),
+);
+```
+
+---
+
+## File Descriptors and Handles
+
+These methods expose the OS-level handles needed to share a buffer with other subsystems such as EGL, Vulkan, or the kernel DRM driver.
+
+### `fd`
+
+```rust
+pub fn fd(&self) -> Result<OwnedFd, InvalidFdError>
+```
+
+Creates a new DMA-BUF (PRIME) file descriptor for the buffer. Each call allocates a fresh file descriptor; the caller is responsible for closing it (the returned [`OwnedFd`](https://doc.rust-lang.org/std/os/unix/io/struct.OwnedFd.html) closes it on drop). Returns [`InvalidFdError`] if libgbm cannot export the buffer.
+
+```rust
+use std::os::unix::io::IntoRawFd;
+
+let dmabuf_fd = bo.fd().expect("DMA-BUF export failed");
+// Pass the raw fd to EGL or V4L2, then it will be closed when dmabuf_fd drops.
+println!("DMA-BUF fd: {}", dmabuf_fd.as_raw_fd());
+```
+
+### `fd_for_plane`
+
+```rust
+pub fn fd_for_plane(&self, plane: i32) -> Result<OwnedFd, InvalidFdError>
+```
+
+Creates a new DMA-BUF file descriptor for a specific plane. Like `fd()`, each call produces a new owned descriptor that must be closed by the caller.
+
+<ParamField path="plane" type="i32" required>
+  Zero-based plane index.
+</ParamField>
+
+```rust
+// Export plane fds for a multi-planar buffer (e.g. NV12)
+let fd0 = bo.fd_for_plane(0).unwrap();
+let fd1 = bo.fd_for_plane(1).unwrap();
+```
+
+### `handle`
+
+```rust
+pub fn handle(&self) -> BufferObjectHandle
+```
+
+Returns the GEM handle for the buffer as a `gbm_bo_handle` union. The exact field to access (`u32_`, `s32`, etc.) depends on the platform and driver.
+
+```rust
+let h = bo.handle();
+// Access the unsigned 32-bit field on most platforms
+println!("GEM handle: {}", unsafe { h.u32_ });
+```
+
+### `handle_for_plane`
+
+```rust
+pub fn handle_for_plane(&self, plane: i32) -> BufferObjectHandle
+```
+
+Returns the GEM handle for a specific plane of a multi-planar buffer.
+
+<ParamField path="plane" type="i32" required>
+  Zero-based plane index.
+</ParamField>
+
+```rust
+let h0 = bo.handle_for_plane(0);
+let h1 = bo.handle_for_plane(1);
+```
+
+### `device_fd`
+
+```rust
+pub fn device_fd(&self) -> BorrowedFd
+```
+
+Returns a borrowed file descriptor for the GBM device that owns this buffer. The lifetime of the returned [`BorrowedFd`](https://doc.rust-lang.org/std/os/unix/io/struct.BorrowedFd.html) is tied to `&self`.
+
+```rust
+let dev_fd = bo.device_fd();
+println!("GBM device fd: {}", dev_fd.as_raw_fd());
+```
+
+---
+
+## CPU Access
+
+GBM provides two mechanisms for the CPU to read or write a buffer's pixel data: closure-based memory mappings and a direct write helper.
+
+### `map`
+
+```rust
+pub fn map<'a, F, S>(
+    &'a self,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    f: F,
+) -> IoResult<S>
+where
+    F: FnOnce(&MappedBufferObject<'a, T>) -> S,
+```
+
+Maps a rectangular region of the buffer for **read-only** CPU access. The region is described by its top-left corner `(x, y)` and dimensions `(width, height)`. The closure `f` receives a [`MappedBufferObject`](/api/mapped-buffer-object) reference; the mapping is released automatically when the closure returns. Returns an `Err` if the kernel mapping call fails.
+
+<ParamField path="x" type="u32" required>
+  Left edge of the region to map, in pixels.
+</ParamField>
+<ParamField path="y" type="u32" required>
+  Top edge of the region to map, in pixels.
+</ParamField>
+<ParamField path="width" type="u32" required>
+  Width of the region to map, in pixels.
+</ParamField>
+<ParamField path="height" type="u32" required>
+  Height of the region to map, in pixels.
+</ParamField>
+<ParamField path="f" type="FnOnce(&MappedBufferObject<T>) -> S" required>
+  Closure that receives the read-only mapped view. Runs synchronously before the mapping is released.
+</ParamField>
+
+```rust
+// Read the first pixel of a 32 bpp ARGB buffer
+let pixel = bo
+    .map(0, 0, 1, 1, |mbo| {
+        let bytes = mbo.buffer();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    })
+    .expect("map failed");
+
+println!("top-left pixel (ARGB): {pixel:#010x}");
+```
+
+### `map_mut`
+
+```rust
+pub fn map_mut<'a, F, S>(
+    &'a mut self,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    f: F,
+) -> IoResult<S>
+where
+    F: FnOnce(&mut MappedBufferObject<'a, T>) -> S,
+```
+
+Maps a rectangular region for **read-write** CPU access. The closure receives a mutable [`MappedBufferObject`](/api/mapped-buffer-object); changes written to `buffer_mut()` are flushed back to the GPU buffer when the mapping is released on closure return.
+
+<ParamField path="x" type="u32" required>
+  Left edge of the region to map, in pixels.
+</ParamField>
+<ParamField path="y" type="u32" required>
+  Top edge of the region to map, in pixels.
+</ParamField>
+<ParamField path="width" type="u32" required>
+  Width of the region to map, in pixels.
+</ParamField>
+<ParamField path="height" type="u32" required>
+  Height of the region to map, in pixels.
+</ParamField>
+<ParamField path="f" type="FnOnce(&mut MappedBufferObject<T>) -> S" required>
+  Closure that receives the read-write mapped view.
+</ParamField>
+
+```rust
+// Clear the entire buffer to opaque black (ARGB8888)
+let (w, h) = (bo.width(), bo.height());
+bo.map_mut(0, 0, w, h, |mbo| {
+    for chunk in mbo.buffer_mut().chunks_exact_mut(4) {
+        chunk.copy_from_slice(&[0x00, 0x00, 0x00, 0xFF]); // B G R A
+    }
+})
+.expect("map_mut failed");
+```
+
+### `write`
+
+```rust
+pub fn write(&mut self, buffer: &[u8]) -> IoResult<()>
+```
+
+Copies the contents of `buffer` directly into the GBM buffer object. The buffer object **must** have been created with [`BufferObjectFlags::WRITE`](/api/buffer-object-flags). The caller is responsible for ensuring `buffer` contains valid pixel data matching the buffer's width, height, stride, and format.
+
+<ParamField path="buffer" type="&[u8]" required>
+  Raw pixel bytes to write. Must represent valid data for the buffer's format and dimensions.
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, Format};
+
+let mut bo = device
+    .create_buffer_object::<()>(64, 64, Format::Argb8888, BufferObjectFlags::WRITE)
+    .unwrap();
+
+// Fill with a flat colour (BGRA byte order for ARGB8888)
+let pixel_data: Vec<u8> = (0..64 * 64)
+    .flat_map(|_| [0x40u8, 0x80, 0xC0, 0xFF]) // teal
+    .collect();
+
+bo.write(&pixel_data).expect("write failed");
+```
+
+---
+
+## Userdata
+
+`BufferObject<T>` can hold a single value of type `T` (the type parameter). The data is heap-allocated and libgbm is given a destructor callback so the value is dropped when the buffer object is destroyed — even if Rust code never calls `take_userdata`.
+
+### `set_userdata`
+
+```rust
+pub fn set_userdata(&mut self, userdata: T) -> Option<T>
+```
+
+Attaches `userdata` to the buffer object. If data was already set, the previous value is returned as `Some(T)`. If no data was previously attached, returns `None`.
+
+<ParamField path="userdata" type="T" required>
+  Value to associate with this buffer object.
+</ParamField>
+
+```rust
+struct Meta { label: String }
+
+let old = bo.set_userdata(Meta { label: "framebuffer-0".into() });
+assert!(old.is_none());
+```
+
+### `userdata`
+
+```rust
+pub fn userdata(&self) -> Option<&T>
+```
+
+Returns a shared reference to the attached userdata, or `None` if no userdata has been set.
+
+```rust
+if let Some(meta) = bo.userdata() {
+    println!("buffer label: {}", meta.label);
+}
+```
+
+### `userdata_mut`
+
+```rust
+pub fn userdata_mut(&mut self) -> Option<&mut T>
+```
+
+Returns an exclusive reference to the attached userdata, or `None` if no userdata has been set.
+
+```rust
+if let Some(meta) = bo.userdata_mut() {
+    meta.label.push_str(" (dirty)");
+}
+```
+
+### `take_userdata`
+
+```rust
+pub fn take_userdata(&mut self) -> Option<T>
+```
+
+Removes and returns the attached userdata. After this call `userdata()` will return `None`. The libgbm destructor callback is cleared so that the value is not double-freed.
+
+```rust
+if let Some(meta) = bo.take_userdata() {
+    println!("reclaimed: {}", meta.label);
+}
+assert!(bo.userdata().is_none());
+```
+
+### `clear_userdata`
+
+```rust
+pub fn clear_userdata(&mut self)
+```
+
+Drops the attached userdata in place without returning it. Equivalent to calling `take_userdata()` and discarding the result.
+
+```rust
+bo.set_userdata(42u32);
+bo.clear_userdata();
+assert!(bo.userdata().is_none());
+```
+
+**Full userdata example**
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+#[derive(Debug)]
+struct FbMeta {
+    sequence: u64,
+    rendered: bool,
+}
+
+let mut bo = device
+    .create_buffer_object::<FbMeta>(
+        1920,
+        1080,
+        Format::Xrgb8888,
+        BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+    )
+    .unwrap();
+
+bo.set_userdata(FbMeta { sequence: 0, rendered: false });
+
+// Later, after rendering:
+if let Some(meta) = bo.userdata_mut() {
+    meta.sequence += 1;
+    meta.rendered = true;
+}
+
+println!("{:?}", bo.userdata());
+```

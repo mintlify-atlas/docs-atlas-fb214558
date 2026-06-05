@@ -1,0 +1,187 @@
+---
+title: "Types and Re-exports in gbm.rs"
+sidebarTitle: "Types"
+description: "Reference for gbm.rs public types: Format, Modifier, BufferObjectHandle, EGLImage, and the AsRaw trait for accessing raw libgbm pointers."
+---
+
+gbm.rs exposes several public types — some defined within the crate itself, and some re-exported from upstream dependencies. Understanding these types is essential for working with pixel formats, tiling modifiers, hardware buffer handles, and the underlying C API pointers that EGL and DRM consume.
+
+---
+
+## Format
+
+```rust
+pub use drm_fourcc::DrmFourcc as Format;
+```
+
+`Format` is a re-export of [`drm_fourcc::DrmFourcc`](https://docs.rs/drm-fourcc/latest/drm_fourcc/enum.DrmFourcc.html). It is an enum of all DRM FourCC pixel format codes and is used wherever gbm.rs accepts or returns a pixel format — for example in `Device::create_buffer_object` and `BufferObject::format`.
+
+**Commonly used variants:**
+
+| Variant | FourCC | Description |
+|---|---|---|
+| `Format::Argb8888` | `AR24` | 32-bit ARGB with 8-bit alpha — common for compositing. |
+| `Format::Xrgb8888` | `XR24` | 32-bit RGB with padding byte — common scanout format. |
+| `Format::Nv12` | `NV12` | YCbCr 4:2:0 semi-planar — common for video content. |
+
+#### Example
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let bo = device.create_buffer_object::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+
+assert_eq!(bo.format(), Format::Xrgb8888);
+```
+
+---
+
+## Modifier
+
+```rust
+pub use drm_fourcc::DrmModifier as Modifier;
+```
+
+`Modifier` is a re-export of [`drm_fourcc::DrmModifier`](https://docs.rs/drm-fourcc/latest/drm_fourcc/enum.DrmModifier.html). It represents a tiling or compression modifier that qualifies a pixel format. Modifiers describe how pixel data is physically arranged in memory — linearly, in a vendor-specific tile pattern, or with lossless compression applied.
+
+`Modifier` values are passed to surface and buffer creation methods that accept explicit modifiers (e.g. `Device::create_surface_with_modifiers`), and are returned by `BufferObject::modifier`.
+
+**Commonly used values:**
+
+| Variant | Value | Description |
+|---|---|---|
+| `Modifier::Linear` | `0` | Linear (row-major) layout — universally supported. |
+| `Modifier::Invalid` | `0x00ffffffffffffff` | Sentinel meaning "no valid modifier" or "unknown". |
+
+#### Example
+
+```rust
+use gbm::{BufferObjectFlags, Format, Modifier};
+
+// Create a surface that accepts either linear or a vendor tile format.
+let modifiers = [Modifier::Linear];
+let surface = device.create_surface_with_modifiers::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    modifiers.into_iter(),
+)?;
+```
+
+---
+
+## BufferObjectHandle
+
+```rust
+pub type BufferObjectHandle = ffi::gbm_bo_handle;
+```
+
+`BufferObjectHandle` is a type alias for the C union `gbm_bo_handle` from `gbm-sys`. It is returned by `BufferObject::handle()` and `BufferObject::handle_for_plane()`, and provides platform-specific access to the underlying buffer handle in whichever representation the kernel and GPU driver use.
+
+Because `gbm_bo_handle` is a C union, all fields are available but only one is meaningful on any given platform. Accessing the wrong field is safe in the Rust sense (the type is `Copy`), but yields garbage data.
+
+**Union fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `ptr` | `*mut libc::c_void` | Pointer representation. |
+| `s32` | `i32` | Signed 32-bit integer representation. |
+| `u32_` | `u32` | Unsigned 32-bit integer — most common on DRM (GEM handle). |
+| `s64` | `i64` | Signed 64-bit integer representation. |
+| `u64_` | `u64` | Unsigned 64-bit integer representation. |
+
+#### Example
+
+```rust
+use gbm::AsRaw;
+
+let handle = bo.handle();
+
+// On DRM/KMS, the GEM handle is stored in the u32_ field.
+// SAFETY: This is the correct field for DRM GEM handles on Linux.
+let gem_handle: u32 = unsafe { handle.u32_ };
+println!("GEM handle: {gem_handle}");
+```
+
+---
+
+## EGLImage
+
+<Note>
+`EGLImage` is only available when the `import-egl` Cargo feature is enabled.
+</Note>
+
+```rust
+#[cfg(feature = "import-egl")]
+pub type EGLImage = *mut libc::c_void;
+```
+
+`EGLImage` is a raw C pointer (`*mut c_void`) used to represent an opaque `EGLImageKHR` handle. It is the argument type for `Device::import_buffer_object_from_egl`, which wraps an existing EGL image in a GBM buffer object so it can be used with DRM/KMS.
+
+Because this is a raw pointer, all usual pointer safety rules apply: passing a null pointer or an invalid `EGLImageKHR` handle is undefined behavior.
+
+#### Example
+
+```rust
+#[cfg(feature = "import-egl")]
+{
+    // egl_image: EGLImageKHR obtained from your EGL implementation,
+    // cast to *mut libc::c_void.
+    let egl_image: gbm::EGLImage = raw_egl_image_khr as *mut libc::c_void;
+
+    // SAFETY: egl_image is a valid, non-null EGLImageKHR handle.
+    let bo = unsafe {
+        device.import_buffer_object_from_egl::<()>(
+            egl_image,
+            gbm::BufferObjectFlags::SCANOUT,
+        )
+    }?;
+}
+```
+
+---
+
+## AsRaw&lt;T&gt; Trait
+
+```rust
+pub trait AsRaw<T> {
+    fn as_raw(&self) -> *const T;
+}
+```
+
+`AsRaw<T>` is gbm.rs's escape hatch to the underlying `libgbm` C types. Every major gbm.rs struct implements it with its corresponding FFI type, allowing you to pass raw pointers into C APIs that gbm.rs does not wrap directly (such as `eglCreateWindowSurface`).
+
+**Implementations:**
+
+| Type | FFI type T |
+|---|---|
+| `Device<T>` | `gbm_sys::gbm_device` |
+| `BufferObject<T>` | `gbm_sys::gbm_bo` |
+| `Surface<T>` | `gbm_sys::gbm_surface` |
+
+The returned pointer is valid for the lifetime of the Rust value. Never store it beyond that lifetime, and never free it — the Rust wrapper handles destruction automatically.
+
+#### Example
+
+```rust
+use gbm::AsRaw;
+
+// Obtain raw pointers for use with C APIs.
+let raw_device: *const gbm_sys::gbm_device  = device.as_raw();
+let raw_surface: *const gbm_sys::gbm_surface = surface.as_raw();
+let raw_bo: *const gbm_sys::gbm_bo           = bo.as_raw();
+
+// Example: pass raw_surface to eglCreateWindowSurface.
+// The EGL spec requires a *mut NativeWindowType, so cast accordingly.
+let egl_surface = egl.create_window_surface(
+    egl_display,
+    egl_config,
+    raw_surface as *mut std::ffi::c_void,
+    None,
+)?;
+```

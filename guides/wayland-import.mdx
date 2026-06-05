@@ -1,0 +1,105 @@
+---
+title: "Import Wayland Buffers into GBM for Display Composition"
+sidebarTitle: "Wayland Import"
+description: "Use gbm.rs to import WlBuffer objects from Wayland clients into GBM buffer objects, enabling display composition with DRM/KMS."
+---
+
+When a Wayland compositor receives a buffer commit from a client, the underlying pixel memory is often already GPU-accessible — either as a GBM buffer the client allocated itself or as a DMA-BUF shared through the `zwp_linux_dmabuf_v1` protocol. Rather than copying that pixel data into a new allocation, gbm.rs provides `import_buffer_object_from_wayland`, which wraps the client's `WlBuffer` in a GBM `BufferObject` that shares the same backing memory. The resulting buffer object can then be passed directly to a DRM framebuffer or composited using EGL — without any extra allocation or copy.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="import-wayland feature" icon="toggle-on">
+    The `import-wayland` feature must be enabled. It is on by default and pulls in `wayland-server 0.31` and `wayland-backend`.
+  </Card>
+  <Card title="wayland-server 0.31" icon="server">
+    Your compositor must use `wayland-server = "0.31"` so that `WlBuffer` matches the type expected by gbm.rs.
+  </Card>
+</CardGroup>
+
+## Cargo.toml Configuration
+
+```toml
+[dependencies]
+gbm = { version = "0.18", features = ["import-wayland", "drm-support"] }
+wayland-server = "0.31"
+drm = "0.14"
+```
+
+The `import-wayland` feature is included in gbm's `default` feature set, so you only need to opt out explicitly if you want to exclude it:
+
+```toml
+[dependencies]
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+```
+
+## Importing a WlBuffer
+
+The method signature for importing a Wayland buffer is:
+
+```rust
+pub fn import_buffer_object_from_wayland<U: 'static>(
+    &self,
+    buffer: &WlBuffer,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+- **`buffer`** — a reference to the `WlBuffer` received in a `wl_surface::commit` or `wl_buffer::attach` handler.
+- **`usage`** — a combination of [`BufferObjectFlags`] describing intended use. Use `SCANOUT` to present via KMS, and add `RENDERING` if you need to sample from it in a shader.
+- **Returns** — `IoResult<BufferObject<U>>`, where `U` is any `'static` userdata type (use `()` if you need none).
+
+## Example: Handling a Buffer Commit
+
+The following example shows how to import a `WlBuffer` inside a `wl_surface::commit` handler and immediately create a DRM framebuffer for scanout.
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+use wayland_server::protocol::wl_buffer::WlBuffer;
+use drm::control::Device as ControlDevice;
+
+fn on_buffer_commit(
+    gbm: &Device<Card>,           // your GBM device (drm-support enabled)
+    wl_buffer: &WlBuffer,
+) {
+    // Import the Wayland buffer into a GBM buffer object.
+    // The imported object shares pixel memory with the WlBuffer.
+    let bo = gbm
+        .import_buffer_object_from_wayland::<()>(
+            wl_buffer,
+            BufferObjectFlags::SCANOUT,
+        )
+        .expect("failed to import WlBuffer into GBM");
+
+    // Create a DRM framebuffer from the imported buffer object.
+    // BufferObject<T> implements drm::buffer::Buffer when drm-support is on.
+    let fb = gbm
+        .add_framebuffer(&bo, 24, 32)
+        .expect("failed to create framebuffer from imported buffer");
+
+    // Schedule a page flip to present the buffer.
+    // (acquire crtc_handle and event_fd from your DRM setup)
+    // gbm.page_flip(crtc_handle, fb, PageFlipFlags::EVENT, None).unwrap();
+
+    println!(
+        "Imported {}x{} buffer as framebuffer",
+        bo.width(),
+        bo.height()
+    );
+}
+```
+
+<Warning>
+  The `BufferObject` returned by `import_buffer_object_from_wayland` shares its pixel memory with the originating `WlBuffer`. The Wayland client **must not** write to or destroy the buffer while it is locked for scanout. Send a `wl_buffer::release` event to the client only after the page flip completes and you have dropped or released the `BufferObject`.
+</Warning>
+
+## Feature Gate Details
+
+<Note>
+  The `import-wayland` feature pulls in two crates:
+
+  - `wayland-server = "0.31"` — provides the `WlBuffer` type and the `Resource` trait used to extract the underlying object pointer.
+  - `wayland-backend = "0.3"` with the `server_system` feature — required by `wayland-server` for the system-level dispatch backend.
+
+  If your project uses a different major version of `wayland-server`, you must align on `0.31` or disable `import-wayland` and implement your own import path using `import_buffer_object_from_dma_buf` with the buffer's DMA-BUF file descriptor.
+</Note>

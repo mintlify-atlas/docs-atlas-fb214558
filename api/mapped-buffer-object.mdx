@@ -1,0 +1,217 @@
+---
+title: "MappedBufferObject<'a, T> - CPU-Mapped Buffer Access"
+sidebarTitle: "MappedBufferObject"
+description: "Reference for MappedBufferObject<'a, T> in gbm.rs: access buffer dimensions, stride, and raw pixel bytes during a CPU-mapped region lifetime."
+---
+
+`MappedBufferObject<'a, T>` is a short-lived view of a CPU-mapped GBM buffer region. It is created exclusively through [`BufferObject::map`](/api/buffer-object#map) (read-only) or [`BufferObject::map_mut`](/api/buffer-object#map_mut) (read-write) and exists only for the duration of the closure passed to those methods. When the `MappedBufferObject` is dropped at the end of the closure, `gbm_bo_unmap` is called automatically, flushing any pending writes back to the GPU buffer and releasing the CPU mapping. You never construct `MappedBufferObject` directly.
+
+## Type Definition
+
+```rust
+pub struct MappedBufferObject<'a, T: 'static>
+```
+
+The lifetime `'a` is borrowed from the `BufferObject<T>` that produced this mapping — either `&'a BufferObject<T>` (read-only) or `&'a mut BufferObject<T>` (read-write). This ensures the mapping cannot outlive the buffer object it came from, and that a mutable mapping holds an exclusive borrow, preventing concurrent access.
+
+## Trait Implementations
+
+| Trait | Notes |
+|---|---|
+| `Debug` | Prints the mapping mode (`read` or `write`) and the inner `BufferObject` debug output. |
+| `Deref<Target = BufferObject<T>>` | Provides transparent access to all `BufferObject<T>` methods (`width`, `height`, `format`, `fd`, etc.) through the mapped view. |
+| `DerefMut` | Available only for mutable mappings (`map_mut`). Panics at runtime if attempted on a read-only mapping (this case is unreachable under safe usage). |
+| `Drop` | Calls `gbm_bo_unmap` and frees the mapping when the closure scope ends. |
+
+---
+
+## Methods
+
+### `stride`
+
+```rust
+pub fn stride(&self) -> u32
+```
+
+Returns the stride (row pitch) of the **mapped region** in bytes, as calculated by the GBM backend at mapping time. This may differ from `BufferObject::stride()` if the backend uses a staging buffer internally.
+
+<Note>
+The total byte length of the mapped pixel data is `height() * stride()`. Always use the mapped stride — not the buffer's stride — when indexing into `buffer()` or `buffer_mut()`.
+</Note>
+
+```rust
+bo.map(0, 0, bo.width(), bo.height(), |mbo| {
+    println!("mapping stride: {} bytes/row", mbo.stride());
+})
+.unwrap();
+```
+
+### `height`
+
+```rust
+pub fn height(&self) -> u32
+```
+
+Returns the height of the mapped region in pixels. This equals the `height` argument supplied to `map` or `map_mut`.
+
+```rust
+bo.map(0, 0, 320, 240, |mbo| {
+    assert_eq!(mbo.height(), 240);
+})
+.unwrap();
+```
+
+### `width`
+
+```rust
+pub fn width(&self) -> u32
+```
+
+Returns the width of the mapped region in pixels. This equals the `width` argument supplied to `map` or `map_mut`.
+
+```rust
+bo.map(0, 0, 320, 240, |mbo| {
+    assert_eq!(mbo.width(), 320);
+})
+.unwrap();
+```
+
+### `x`
+
+```rust
+pub fn x(&self) -> u32
+```
+
+Returns the X coordinate (left edge, top-left origin) of the mapped region in pixels. This equals the `x` argument supplied to `map` or `map_mut`.
+
+```rust
+bo.map(16, 32, 64, 64, |mbo| {
+    assert_eq!(mbo.x(), 16);
+})
+.unwrap();
+```
+
+### `y`
+
+```rust
+pub fn y(&self) -> u32
+```
+
+Returns the Y coordinate (top edge, top-left origin) of the mapped region in pixels. This equals the `y` argument supplied to `map` or `map_mut`.
+
+```rust
+bo.map(16, 32, 64, 64, |mbo| {
+    assert_eq!(mbo.y(), 32);
+})
+.unwrap();
+```
+
+### `buffer`
+
+```rust
+pub fn buffer(&self) -> &[u8]
+```
+
+Returns a read-only byte slice covering the entire mapped region. The slice length is `height * stride` bytes. Pixels are laid out row by row; each row is `stride` bytes wide, with `width * bytes_per_pixel` bytes of actual pixel data followed by any padding bytes required for alignment.
+
+```rust
+bo.map(0, 0, bo.width(), bo.height(), |mbo| {
+    let bytes = mbo.buffer();
+    println!("mapped {} bytes total", bytes.len());
+
+    // Read the first row
+    let row = &bytes[..mbo.stride() as usize];
+    println!("first row starts with: {:02X?}", &row[..4]);
+})
+.unwrap();
+```
+
+### `buffer_mut`
+
+```rust
+pub fn buffer_mut(&mut self) -> &mut [u8]
+```
+
+Returns a mutable byte slice covering the entire mapped region. Only available inside a `map_mut` closure. Changes written to this slice are flushed to the GPU buffer when the mapping is dropped at closure return.
+
+```rust
+bo.map_mut(0, 0, bo.width(), bo.height(), |mbo| {
+    let bytes = mbo.buffer_mut();
+    // Zero out the entire mapped region
+    bytes.fill(0);
+})
+.unwrap();
+```
+
+---
+
+## Read Example
+
+Read a 1×1 pixel region from a `Format::Argb8888` buffer and decode it into component channels:
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let bo = device
+    .create_buffer_object::<()>(256, 256, Format::Argb8888, BufferObjectFlags::RENDERING)
+    .unwrap();
+
+// Sample the pixel at (10, 20)
+let (a, r, g, b) = bo
+    .map(10, 20, 1, 1, |mbo| {
+        let px = mbo.buffer();
+        // ARGB8888 is stored as B G R A in memory on little-endian systems
+        (px[3], px[2], px[1], px[0])
+    })
+    .expect("map failed");
+
+println!("pixel @ (10,20): A={a} R={r} G={g} B={b}");
+```
+
+---
+
+## Write Example
+
+Map a full buffer for writing and paint every pixel red using `map_mut`:
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let mut bo = device
+    .create_buffer_object::<()>(
+        64,
+        64,
+        Format::Argb8888,
+        BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
+    )
+    .unwrap();
+
+let (w, h) = (bo.width(), bo.height());
+
+bo.map_mut(0, 0, w, h, |mbo| {
+    let stride = mbo.stride() as usize;
+    let buf    = mbo.buffer_mut();
+
+    for row in 0..mbo.height() as usize {
+        let row_start = row * stride;
+        let row_bytes = &mut buf[row_start..row_start + mbo.width() as usize * 4];
+
+        // ARGB8888 in memory: B=0x00, G=0x00, R=0xFF, A=0xFF
+        for pixel in row_bytes.chunks_exact_mut(4) {
+            pixel[0] = 0x00; // Blue
+            pixel[1] = 0x00; // Green
+            pixel[2] = 0xFF; // Red
+            pixel[3] = 0xFF; // Alpha
+        }
+    }
+})
+.expect("map_mut failed");
+```
+
+<Note>
+The byte length of the slice returned by `buffer()` and `buffer_mut()` is always `height * stride`, not `height * width * bytes_per_pixel`. The stride is guaranteed to be at least `width * bytes_per_pixel`, but may be larger due to hardware row-alignment requirements. Always iterate rows using the stride value to avoid reading padding bytes as pixel data.
+</Note>
+
+<Warning>
+`buffer()` and `buffer_mut()` provide raw byte access to the mapped memory. There is no format awareness — bytes must be interpreted according to the buffer's pixel format (obtainable via `mbo.format()`, since `MappedBufferObject` derefs to `BufferObject`) and the mapped stride. Incorrect indexing or format assumptions will produce corrupt pixel data silently.
+</Warning>

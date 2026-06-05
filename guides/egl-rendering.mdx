@@ -1,0 +1,148 @@
+---
+title: "EGL Rendering with GBM Surfaces on DRM"
+sidebarTitle: "EGL Rendering"
+description: "Set up GBM surfaces as native window types for EGL, render with OpenGL ES, and present frames to the display using the GBM front buffer protocol."
+---
+
+GBM surfaces serve as the bridge between GPU rendering and KMS display output. The `Surface<T>` type created by gbm.rs implements the EGL native window interface: its raw pointer — obtained via the `AsRaw` trait — is passed to `eglCreateWindowSurface` as the `EGLNativeWindowType`. After each `eglSwapBuffers` call, GBM promotes the rendered back buffer to the front and makes it available for scanout. You then lock that front buffer with `lock_front_buffer`, wrap it in a DRM framebuffer, and issue a page flip. This cycle repeats every frame, giving you tear-free, GPU-accelerated output on bare-metal DRM with no display server required.
+
+## Required Feature Flags
+
+The full rendering loop depends on two gbm.rs features:
+
+| Feature | Purpose |
+|---|---|
+| `drm-support` | Enables `add_framebuffer` and the `drm::buffer::Buffer` impl on `BufferObject` |
+| `import-egl` | Exposes `EGLImage` type alias and `import_buffer_object_from_egl` |
+
+Both are on by default. Confirm your `Cargo.toml`:
+
+```toml
+[dependencies]
+gbm = { version = "0.18", features = ["drm-support", "import-egl"] }
+drm = "0.14"
+```
+
+## Rendering Loop Overview
+
+<Steps>
+  <Step title="Create the GBM Surface">
+    Allocate a `Surface<T>` with the `SCANOUT` and `RENDERING` flags. `RENDERING` tells the allocator the buffer will be used as a render target; `SCANOUT` signals it will also be presented to the display. Use `Format::Argb8888` for surfaces that may include transparency during composition.
+
+    ```rust
+    use gbm::{BufferObjectFlags, Device, Format};
+
+    // `gbm` is your `Device<Card>` from the DRM integration step.
+    let surface = gbm
+        .create_surface::<()>(
+            1920,
+            1080,
+            Format::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .expect("failed to create GBM surface");
+    ```
+  </Step>
+
+  <Step title="Pass the Raw Pointer to EGL">
+    EGL expects an `EGLNativeWindowType`, which on GBM is simply the raw `gbm_surface` pointer. Retrieve it with `AsRaw::as_raw` and cast it to the platform native window type before passing it to `eglCreateWindowSurface`.
+
+    ```rust
+    use gbm::AsRaw;
+
+    // The raw *const gbm_surface pointer is the EGLNativeWindowType on DRM/GBM.
+    let native_window = surface.as_raw() as *mut std::ffi::c_void;
+
+    // Pass `native_window` to your EGL bindings:
+    //   egl::CreateWindowSurface(egl_display, config, native_window, ptr::null())
+    ```
+
+    <Note>
+      `as_raw()` returns a `*const gbm_surface`. Most EGL bindings expect a `*mut c_void`; a double cast through `as_raw_mut()` (also provided by `AsRaw`) or a `as *mut _` coercion is safe here because EGL only reads the pointer value — it does not mutate through it.
+    </Note>
+  </Step>
+
+  <Step title="Check for Free Buffers">
+    Before beginning a new frame, verify that the surface has at least one unlocked buffer available. After the first frame, previously locked front buffers may not yet have been released by the display controller.
+
+    ```rust
+    if !surface.has_free_buffers() {
+        // Wait for the previous page flip to complete and release the buffer,
+        // then retry. In a real compositor this would be driven by a DRM event.
+        eprintln!("no free buffers — waiting for page flip completion");
+        return;
+    }
+    ```
+  </Step>
+
+  <Step title="Render a Frame with OpenGL ES">
+    Issue your OpenGL ES draw calls through the EGL context. When finished, call `eglSwapBuffers` to flush rendering and promote the back buffer to the front. This must happen before `lock_front_buffer`.
+
+    ```rust
+    // --- OpenGL ES rendering (via your chosen bindings) ---
+    // gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+    // gl::DrawArrays(gl::TRIANGLES, 0, vertex_count);
+
+    // Swap buffers — this is what advances the GBM front buffer.
+    // egl::SwapBuffers(egl_display, egl_surface);
+    ```
+  </Step>
+
+  <Step title="Lock the Front Buffer">
+    After `eglSwapBuffers`, call `lock_front_buffer` to obtain a `BufferObject` wrapping the rendered frame. This function is `unsafe` because it must be called exactly once per `eglSwapBuffers` invocation.
+
+    ```rust
+    // SAFETY: called exactly once after eglSwapBuffers.
+    let front_bo = unsafe {
+        surface
+            .lock_front_buffer()
+            .expect("failed to lock front buffer")
+    };
+    ```
+  </Step>
+
+  <Step title="Create a Framebuffer and Page Flip">
+    Wrap the locked `BufferObject` in a DRM framebuffer, then schedule a page flip. When the flip completes, drop `front_bo` to release the buffer back to the GBM surface pool.
+
+    ```rust
+    use drm::control::Device as ControlDevice;
+
+    // `gbm` implements ControlDevice when drm-support is enabled.
+    let fb = gbm
+        .add_framebuffer(&front_bo, 24, 32)
+        .expect("failed to create DRM framebuffer");
+
+    // Queue the page flip. The DRM event loop will signal completion.
+    // gbm.page_flip(crtc_handle, fb, PageFlipFlags::EVENT, None).unwrap();
+
+    // Keep `front_bo` alive until the page flip event fires.
+    // Dropping it calls gbm_surface_release_buffer internally.
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  `lock_front_buffer` is `unsafe`. The safety contract is strict: it **must** be called exactly once after each `eglSwapBuffers`. Calling it before any swap, skipping a call, or calling it twice for a single swap are all undefined behavior. The `BufferObject` it returns must remain alive (held by your compositor state) until the page flip completes; dropping it early releases the buffer back to GBM while the display controller may still be reading from it.
+</Warning>
+
+<Note>
+  Always check `surface.has_free_buffers()` before starting a new frame. A GBM surface has a finite pool of backing buffers. If you lock a front buffer but do not release it before the next `eglSwapBuffers`, the surface may run out of free buffers and `lock_front_buffer` will return a `FrontBufferError`.
+</Note>
+
+<Tip>
+  For hardware that supports format modifiers (e.g., tiled layouts for better GPU cache performance), use `create_surface_with_modifiers` or `create_surface_with_modifiers2` instead of `create_surface`. Pass the modifiers advertised by the DRM plane to ensure the allocated buffers are directly scannable without a costly linear blit.
+
+  ```rust
+  use gbm::Modifier;
+
+  // Example: allow the driver to pick among LINEAR and any implicit modifier.
+  let surface = gbm
+      .create_surface_with_modifiers::<()>(
+          1920,
+          1080,
+          Format::Argb8888,
+          [Modifier::Linear].into_iter(),
+      )
+      .expect("failed to create surface with modifiers");
+  ```
+</Tip>

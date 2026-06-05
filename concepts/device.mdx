@@ -1,0 +1,155 @@
+---
+title: "GBM Device: Gateway to GPU Buffer Allocation"
+sidebarTitle: "Device"
+description: "The Device<T> type wraps an open DRM file descriptor and provides methods to allocate buffers, create surfaces, and query backend capabilities."
+---
+
+`Device<T>` is the entry point for everything in gbm.rs. It wraps an open DRM file descriptor — typically a `File` or `OwnedFd` pointing to `/dev/dri/card0` or a render node like `/dev/dri/renderD128` — and calls `gbm_create_device` to initialise the GBM context for that GPU. Every buffer object and surface you allocate is produced by a `Device`, and the device keeps the underlying `gbm_device` alive for as long as any object it created is still in scope.
+
+## The Generic Parameter `T`
+
+`Device<T>` is generic over `T: AsFd`. The `AsFd` bound means gbm.rs can borrow the file descriptor from any standard owner without taking ownership of it permanently. Common choices are:
+
+| Type | Notes |
+|---|---|
+| `std::fs::File` | Typical choice; opened with `OpenOptions`. Closed when the `File` drops. |
+| `std::os::unix::io::OwnedFd` | Bare owned descriptor with no `File` overhead. |
+| Custom newtype | Any struct that wraps a fd and implements `AsFd` (e.g. a drm-rs `Card`). |
+
+`Device<T>` implements `Deref<Target = T>` and `DerefMut<Target = T>`, so you can call methods on the inner type directly through a `Device` reference. If `T` also implements `drm::Device` or `drm::control::Device`, those method sets become available on the `Device<T>` reference without any casting.
+
+## Creating a Device
+
+```rust
+use std::fs::File;
+use gbm::Device;
+
+fn open_gbm() -> std::io::Result<Device<File>> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/card0")?;
+
+    // Calls gbm_create_device(fd) internally.
+    // Returns Err if libgbm cannot initialise a backend for this device.
+    Device::new(file)
+}
+```
+
+`Device::new(fd)` is the only constructor. It calls `gbm_create_device` with the raw file descriptor obtained from `fd.as_fd()`. On success it returns `Ok(Device<T>)`; on failure it returns `Err` with the last OS error set by libgbm.
+
+## Cloning a Device
+
+When `T: Clone`, `Device<T>` also implements `Clone`. Cloning shares the underlying `gbm_device` — both the original and the clone hold an `Arc` reference to the same raw pointer, and `gbm_device_destroy` is called exactly once when the last clone is dropped. The inner `T` is cloned independently (producing a second file descriptor if `T` is `File`).
+
+```rust
+use std::fs::File;
+use gbm::Device;
+
+let file = File::options().read(true).write(true).open("/dev/dri/card0")?;
+let gbm = Device::new(file)?;
+
+// Clone shares the gbm_device; the File is also cloned.
+let gbm2 = gbm.clone();
+
+// Both refer to the same GBM context.
+assert_eq!(gbm.backend_name(), gbm2.backend_name());
+```
+
+## Querying the Backend
+
+### `backend_name()`
+
+Returns the name of the GBM backend that libgbm selected for this device. On Mesa systems this is typically `"drm"`.
+
+```rust
+println!("GBM backend: {}", gbm.backend_name());
+// → "drm"
+```
+
+### `is_format_supported(format, usage)`
+
+Asks libgbm whether the driver supports allocating a buffer with the given pixel format and usage flags. Always call this before allocating a buffer with a format/usage combination you are not certain the driver handles.
+
+```rust
+use gbm::{Format, BufferObjectFlags};
+
+let supported = gbm.is_format_supported(
+    Format::Argb8888,
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+);
+
+if supported {
+    println!("ARGB8888 scanout+rendering is supported");
+} else {
+    eprintln!("Format/usage combination not supported by this driver");
+}
+```
+
+### `format_modifier_plane_count(format, modifier)`
+
+Returns the number of planes required for a given format and modifier combination, or `None` if the combination does not have a fixed plane count (for example when `Modifier::Invalid` is used).
+
+```rust
+use gbm::{Format, Modifier};
+
+match gbm.format_modifier_plane_count(Format::Nv12, Modifier::Linear) {
+    Some(n) => println!("NV12 linear requires {} plane(s)", n),
+    None    => println!("Plane count indeterminate for this modifier"),
+}
+```
+
+## Allocating Buffers and Surfaces
+
+`Device` is the factory for both `BufferObject` and `Surface`. Allocation methods are covered in detail on their own pages, but here is a brief overview:
+
+<CardGroup cols={2}>
+  <Card title="create_buffer_object" icon="box">
+    Allocates a buffer with a given width, height, format, and usage flags.
+    Use for cursor planes, import targets, or any buffer you manage manually.
+  </Card>
+  <Card title="create_buffer_object_with_modifiers" icon="box">
+    Same as above but accepts an explicit list of DRM format modifiers,
+    letting the driver choose the optimal tiling layout.
+  </Card>
+  <Card title="create_buffer_object_with_modifiers2" icon="box">
+    Like `with_modifiers` but also accepts usage flags, combining the
+    flexibility of both previous variants.
+  </Card>
+  <Card title="create_surface" icon="display">
+    Allocates a GBM surface suitable for use as an EGL native window.
+    Returns a `Surface<U>` that manages an internal buffer pool.
+  </Card>
+</CardGroup>
+
+## Importing Foreign Buffers
+
+`Device` can wrap external GPU memory as a `BufferObject` through several import paths:
+
+```rust
+use std::os::unix::io::BorrowedFd;
+use gbm::{Format, BufferObjectFlags};
+
+// Import a DMA-BUF fd shared by another process or API
+let bo = gbm.import_buffer_object_from_dma_buf::<()>(
+    some_borrowed_fd,
+    1920,        // width
+    1080,        // height
+    7680,        // stride (bytes per row)
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT,
+)?;
+```
+
+Other import variants (enabled by Cargo features) include:
+- `import_buffer_object_from_wayland` — imports a `wl_buffer` (requires `import-wayland` feature).
+- `import_buffer_object_from_egl` — imports an `EGLImage` (requires `import-egl` feature, `unsafe`).
+- `import_buffer_object_from_dma_buf_with_modifiers` — multi-plane DMA-BUF import with explicit modifier.
+
+<Tip>
+  When the `drm-support` feature is enabled, `Device<T>` automatically
+  implements `drm::Device` when `T: drm::Device`, and `drm::control::Device`
+  when `T: drm::control::Device`. This means you can call DRM resource
+  enumeration, framebuffer management, and CRTC control methods directly on
+  the `Device<T>` reference — the `Deref` chain handles the dispatch.
+</Tip>

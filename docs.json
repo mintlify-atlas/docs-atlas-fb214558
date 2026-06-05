@@ -1,72 +1,98 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "gbm.rs",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#624c3e",
+    "light": "#c1ac9b",
+    "dark": "#040404"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/222ce40a-11ec-4d33-81b6-10c65779f0d0.jpg",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/Smithay/gbm.rs"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/Smithay/gbm.rs"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/gbm-overview",
+              "concepts/device",
+              "concepts/buffer-objects",
+              "concepts/surfaces",
+              "concepts/formats-and-modifiers"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/drm-integration",
+              "guides/wayland-import",
+              "guides/egl-rendering",
+              "guides/dma-buf-import"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/cargo-features",
+              "configuration/bindgen"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Device",
+            "pages": [
+              "api/device",
+              "api/device-methods"
+            ]
+          },
+          {
+            "group": "Buffer Object",
+            "pages": [
+              "api/buffer-object",
+              "api/buffer-object-flags",
+              "api/mapped-buffer-object"
+            ]
+          },
+          {
+            "group": "Surface",
+            "pages": [
+              "api/surface"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types",
+              "api/errors"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

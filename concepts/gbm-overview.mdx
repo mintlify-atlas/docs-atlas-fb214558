@@ -1,0 +1,135 @@
+---
+title: "How the Generic Buffer Manager Works"
+sidebarTitle: "GBM Overview"
+description: "Understand the Generic Buffer Manager architecture: how GBM sits between your application, the DRM kernel subsystem, and the GPU hardware."
+---
+
+The Generic Buffer Manager (GBM) is a platform abstraction layer for GPU memory allocation on Linux. It provides a hardware-agnostic API that lets graphics applications request GPU-accessible buffers without knowing which GPU driver or memory allocator sits beneath them. The `gbm.rs` crate wraps libgbm with a safe, idiomatic Rust interface, making it straightforward to integrate buffer management into Wayland compositors, DRM-based display servers, and other low-level graphics stacks.
+
+## The Three Main Constructs
+
+GBM revolves around three interconnected types that map directly to native libgbm concepts:
+
+<CardGroup cols={3}>
+  <Card title="Device&lt;T&gt;" icon="microchip">
+    Wraps an open DRM file descriptor (e.g. `/dev/dri/card0`). Acts as the
+    factory for all buffer objects and surfaces. Every allocation starts
+    here.
+  </Card>
+  <Card title="BufferObject&lt;T&gt;" icon="box">
+    A region of GPU-accessible memory allocated through the device. Carries
+    pixel data and can be exported as a DMA-BUF file descriptor for sharing
+    between processes or APIs.
+  </Card>
+  <Card title="Surface&lt;T&gt;" icon="display">
+    An EGL-compatible rendering surface. Used as the native window type when
+    creating an EGL surface on a DRM platform. Internally manages a small
+    pool of buffer objects that cycle through the rendering pipeline.
+  </Card>
+</CardGroup>
+
+## Why GBM Exists
+
+Before GBM, each GPU driver exposed its own proprietary mechanism for allocating display-ready buffers. A compositor targeting Intel, AMD, and ARM Mali hardware simultaneously needed three separate code paths. GBM solved this by defining a single portable API implemented by Mesa's driver backends (and other vendors). Application code written against GBM works across every driver that provides a GBM backend, with no source-level changes.
+
+GBM also provides the bridge between EGL and DRM. On most embedded and desktop Linux systems, EGL's platform extension `EGL_KHR_platform_gbm` (or equivalently `EGL_MESA_platform_gbm`) lets you pass a `gbm_device` as the native display and a `gbm_surface` as the native window. The GPU driver understands both ends of this contract and wires up rendering output to scanout-capable buffers automatically.
+
+## How gbm.rs Makes This Safe
+
+Raw libgbm is a C API built around opaque pointers that share ownership in subtle ways. `gbm.rs` tames this with a small set of Rust primitives:
+
+<Steps>
+  <Step title="Ptr&lt;T&gt; — Reference-Counted Raw Pointers">
+    The internal `Ptr<T>` type wraps a raw libgbm pointer in an `Arc` and
+    stores a destructor callback. When the last `Ptr` clone is dropped, the
+    callback fires and the underlying libgbm object is freed. This means a
+    `BufferObject` or `Surface` can safely outlive the `Device` that
+    created it — the `gbm_device` is kept alive by its own `Ptr` reference
+    held inside every dependent object.
+  </Step>
+  <Step title="Send + Sync">
+    `Ptr<T>` explicitly implements `Send` and `Sync`. libgbm's types
+    (`gbm_device`, `gbm_surface`, `gbm_bo`) are thread-safe, and reference
+    counting is managed by the atomic `Arc`, so both markers are sound. The
+    test suite in `src/lib.rs` verifies this at compile time for all three
+    public types.
+  </Step>
+  <Step title="Destructor Callbacks for Buffer Objects">
+    `BufferObject<T>` stores arbitrary user data of type `T` through
+    libgbm's `gbm_bo_set_user_data` API. The library registers a C
+    destructor that reconstructs the `Box<T>` and drops it safely whenever
+    the buffer object is freed, even if that happens inside libgbm itself.
+  </Step>
+  <Step title="Lifetime-Scoped CPU Maps">
+    `MappedBufferObject<'a, T>` ties the CPU-accessible map to the lifetime
+    of the source `BufferObject`, ensuring the buffer cannot be freed while
+    the mapped region is live. The map is unmapped in its `Drop`
+    implementation.
+  </Step>
+</Steps>
+
+## The Full Stack
+
+```
+┌─────────────────────────────────────┐
+│         Your Application            │
+│    (compositor, media player, …)    │
+├─────────────────────────────────────┤
+│              gbm.rs                 │
+│  Device / BufferObject / Surface    │
+├─────────────────────────────────────┤
+│             libgbm                  │
+│  (Mesa GBM platform library)        │
+├─────────────────────────────────────┤
+│          DRM Kernel Driver          │
+│  (i915, amdgpu, vc4, panfrost, …)   │
+├─────────────────────────────────────┤
+│           GPU Hardware              │
+└─────────────────────────────────────┘
+```
+
+Each layer speaks only to its immediate neighbor. Your Rust code calls safe methods on `gbm.rs` types; `gbm.rs` calls libgbm through `gbm-sys` FFI bindings; libgbm opens and `ioctl`s the DRM device node; the kernel driver programs the GPU.
+
+## Quick Start
+
+Add `gbm` to your `Cargo.toml`, enabling the `drm-support` feature for seamless integration with `drm-rs`:
+
+```toml
+[dependencies]
+gbm = { version = "0.15", features = ["drm-support"] }
+drm = "0.12"
+```
+
+Then open a DRM device and create a GBM device on top of it:
+
+```rust
+use std::fs::File;
+use std::os::unix::io::AsFd;
+use gbm::{Device, Format, BufferObjectFlags};
+
+// Open the DRM node
+let file = File::options().read(true).write(true).open("/dev/dri/card0")?;
+
+// Wrap it in a GBM device — this calls gbm_create_device internally
+let gbm = Device::new(file)?;
+
+println!("GBM backend: {}", gbm.backend_name());
+
+// Allocate a 1920×1080 scanout buffer
+let bo = gbm.create_buffer_object::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+
+println!("Allocated {}×{} buffer, stride={}", bo.width(), bo.height(), bo.stride());
+```
+
+<Note>
+  GBM is the **native display type** for EGL on DRM platforms. When you call
+  `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device, …)`, EGL uses the
+  same DRM file descriptor that GBM holds to connect rendering output to
+  scanout. This is why every EGL/DRM compositor creates a GBM device before
+  initializing EGL.
+</Note>

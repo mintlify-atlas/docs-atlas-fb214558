@@ -1,0 +1,80 @@
+---
+title: "gbm.rs: Safe libgbm Bindings for Rust"
+sidebarTitle: "Introduction"
+description: "gbm.rs wraps the C libgbm library in safe, idiomatic Rust. Allocate GPU buffers, import Wayland/EGL surfaces, and integrate with DRM/KMS display pipelines."
+---
+
+gbm.rs is a safe, idiomatic Rust library that wraps the C [libgbm](https://gitlab.freedesktop.org/mesa/mesa) (Generic Buffer Manager) library. It gives Rust programs the ability to allocate GPU-side memory buffers, import Wayland and EGL surfaces, and feed those buffers into a DRM/KMS display pipeline — all without writing a single line of unsafe FFI code. Whether you are building a Wayland compositor, a kiosk display, or a low-level graphics tool, gbm.rs provides the memory-management foundation your rendering stack depends on.
+
+## What is the Generic Buffer Manager?
+
+The Generic Buffer Manager (GBM) is a platform-agnostic API that abstracts GPU memory allocation on Linux. It sits between the DRM (Direct Rendering Manager) kernel subsystem and higher-level graphics APIs such as EGL and Vulkan. When a display server or compositor needs to allocate a scanout buffer — a chunk of GPU memory that the hardware display controller can read directly — it asks GBM to negotiate the allocation with the underlying driver. GBM hides the driver-specific details and gives back an opaque buffer handle that other APIs can consume.
+
+For Rust developers targeting Linux graphics stacks (Wayland compositors, embedded display applications, bare-metal kiosk systems), interacting with libgbm directly through raw `unsafe` FFI is error-prone and difficult to maintain. gbm.rs wraps every libgbm entry point in safe Rust, enforces ownership rules through the type system, and propagates errors as standard `std::io::Result` values.
+
+## Key Types
+
+| Type | Role |
+|---|---|
+| `Device<T>` | Owns an open GBM device created from a DRM file descriptor. All buffer and surface allocations start here. |
+| `BufferObject<T>` | Represents a single allocated GPU buffer. Carries an optional generic userdata payload of type `T`. |
+| `Surface<T>` | Represents a GBM surface used together with EGL for rendering. Owns a queue of `BufferObject`s produced by the GPU. |
+| `Format` | Re-exported as `drm_fourcc::DrmFourcc`. Identifies the pixel format (e.g. `Format::Argb8888`). |
+| `Modifier` | Re-exported as `drm_fourcc::DrmModifier`. Describes driver-specific memory layout modifiers. |
+| `BufferObjectFlags` | A `bitflags` set that controls buffer usage: `SCANOUT`, `RENDERING`, `WRITE`, `CURSOR`, `LINEAR`, `PROTECTED`. |
+
+## Features at a Glance
+
+**Safe wrappers** — Every public API is safe Rust. The single unsafe surface is the raw-pointer escape hatch `AsRaw<T>`, which is explicitly marked and gated.
+
+**Arc-based reference counting** — `Device`, `Surface`, and `BufferObject` each hold an `Arc`-wrapped `Ptr` to the underlying libgbm object. Dropping them in any order is safe; the last reference triggers the correct libgbm destructor automatically.
+
+**`Send` + `Sync`** — All three primary types implement both `Send` and `Sync`, verified by compile-time tests in the library. You can freely share GBM objects across threads.
+
+**DRM integration** — With the `drm-support` feature, `Device<T>` automatically implements `drm::Device` and `drm::control::Device` when `T` does. `BufferObject<T>` implements `drm::buffer::Buffer` and `drm::buffer::PlanarBuffer`, enabling direct use with drm-rs APIs such as `add_framebuffer` and `set_crtc`.
+
+**Wayland buffer import** — The `import-wayland` feature adds `Device::import_buffer_object_from_wayland`, turning a `WlBuffer` from wayland-server 0.31 into a GBM `BufferObject` ready for KMS display.
+
+**EGL buffer import** — The `import-egl` feature adds `Device::import_buffer_object_from_egl` and the `EGLImage` type alias, letting GPU-rendered EGL images be scanned out through DRM.
+
+**DMA-BUF import** — `Device::import_buffer_object_from_dma_buf` and its modifier-aware variant allow importing any PRIME file descriptor, enabling zero-copy buffer sharing between processes.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="box" href="/installation">
+    Add gbm.rs to your Cargo project and configure system dependencies.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Allocate a GPU buffer and display it on screen in five steps.
+  </Card>
+  <Card title="Core Concepts" icon="book-open" href="/concepts/gbm-overview">
+    Understand GBM devices, buffer objects, surfaces, and formats.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/device">
+    Browse the full `Device`, `BufferObject`, and `Surface` API.
+  </Card>
+</CardGroup>
+
+## The Smithay Ecosystem
+
+gbm.rs is maintained by the [Smithay](https://github.com/Smithay) project, a community-driven effort to provide a complete, safe Rust toolkit for building Wayland compositors and Linux display servers. gbm.rs works hand in hand with its sibling crate **drm-rs**, which provides safe Rust bindings for the DRM/KMS kernel API.
+
+The typical layering looks like this:
+
+```text
+Your compositor or display application
+         │
+         ├── drm-rs   — mode-setting, connectors, CRTCs, framebuffers
+         └── gbm.rs   — GPU buffer allocation, surface management
+                  │
+                  └── libgbm (system) — driver negotiation
+                           │
+                           └── DRM kernel subsystem
+```
+
+`Device<T>` in gbm.rs is intentionally generic over any type that implements `AsFd`. When `T` is a drm-rs device type (`drm::Device` + `drm::control::Device`), gbm.rs automatically implements those same DRM traits on `Device<T>`, so you can call `add_framebuffer` and `set_crtc` directly on your GBM device handle without juggling two separate objects.
+
+## Version and License
+
+<Note>
+  The current stable release of gbm.rs is **0.18.0**, published on [crates.io](https://crates.io/crates/gbm). The library is released under the **MIT** license. Source code and issue tracking are hosted at [github.com/Smithay/gbm.rs](https://github.com/Smithay/gbm.rs).
+</Note>

@@ -1,0 +1,142 @@
+---
+title: "Surface<T> - GBM Rendering Surface Reference"
+sidebarTitle: "Surface"
+description: "API reference for Surface<T> in gbm.rs: create EGL-compatible rendering surfaces, check buffer availability, and lock the front buffer after swapping."
+---
+
+`Surface<T>` represents a GBM rendering surface backed by an open GBM device. It serves as the native window type for EGL on DRM/KMS platforms — you pass the raw pointer obtained via `AsRaw` directly to `eglCreateWindowSurface`, and EGL allocates and manages the underlying pixel buffers for you. The type parameter `T` is the userdata type attached to any `BufferObject<T>` produced by this surface.
+
+Surfaces are always created through `Device` methods rather than constructed directly. See the [Device Methods reference](/api/device-methods) for `create_surface`, `create_surface_with_modifiers`, and `create_surface_with_modifiers2`.
+
+## Struct Definition
+
+```rust
+pub struct Surface<T: 'static> { /* private fields */ }
+```
+
+### Trait Implementations
+
+| Trait | Notes |
+|---|---|
+| `Debug` | Prints the raw surface pointer and device pointer. |
+| `AsRaw<gbm_surface>` | Returns `*const gbm_surface` for use with EGL and other C APIs. |
+| `Send` | Safe to transfer across threads. |
+| `Sync` | Safe to share references across threads. |
+
+---
+
+## Methods
+
+### `has_free_buffers`
+
+```rust
+pub fn has_free_buffers(&self) -> bool
+```
+
+Returns `true` if the surface has at least one unlocked (free) buffer available for rendering into.
+
+Before a surface has ever been used, one buffer is free by default. Once buffers are locked via [`lock_front_buffer`](#lock_front_buffer), the pool of free buffers shrinks. If all buffers are currently locked — for example, because a DRM page flip is still pending — this returns `false` and you must wait before starting a new frame.
+
+**Returns:** `true` if a buffer is available, `false` if all buffers are locked.
+
+#### Example
+
+```rust
+// Wait until a buffer is available before starting a new frame.
+if !surface.has_free_buffers() {
+    // A previous page flip is still pending; wait for the flip event
+    // before proceeding. Driving the render loop from the flip handler
+    // guarantees a buffer is free when we arrive here.
+    return;
+}
+
+// Safe to begin rendering into the surface now.
+egl.make_current(&egl_surface)?;
+render_frame();
+```
+
+---
+
+### `lock_front_buffer`
+
+```rust
+pub unsafe fn lock_front_buffer(&self) -> Result<BufferObject<T>, FrontBufferError>
+```
+
+Locks the current front buffer of the surface and returns it as a `BufferObject<T>`. This is the buffer that was most recently rendered into and presented by calling `eglSwapBuffers`.
+
+The returned `BufferObject<T>` holds an exclusive lock on that buffer. When you drop the `BufferObject`, the lock is automatically released and the buffer re-enters the free pool — you do **not** call any release function manually.
+
+**Returns:** `Ok(BufferObject<T>)` on success, `Err(FrontBufferError)` if `libgbm` returns a null pointer.
+
+<Warning>
+**Unsafe invariant — read carefully before calling.**
+
+This function must be called **exactly once** after each `eglSwapBuffers` call on the associated EGL surface. Calling it:
+
+- **Before** any `eglSwapBuffers` has been issued on the surface, or
+- **More than once** after a single `eglSwapBuffers`,
+
+constitutes a violation of the libgbm API contract and results in **undefined behavior**. Always ensure one swap has completed before locking, and release the previous buffer (drop it) before locking again.
+</Warning>
+
+#### Example
+
+```rust
+// Render the frame and swap buffers via EGL (using raw pointers shown
+// for clarity — integrate with your EGL wrapper as appropriate).
+egl.swap_buffers(&egl_surface)?;
+
+// Exactly once after the swap: lock the front buffer.
+// SAFETY: eglSwapBuffers was called exactly once since the last lock.
+let bo = unsafe { surface.lock_front_buffer() }?;
+
+// bo now contains the rendered frame. Use it to create a DRM
+// framebuffer and schedule a page flip.
+let fb = drm_device.add_framebuffer(&bo, 32, 32)?;
+drm_device.page_flip(crtc, fb, PageFlipFlags::EVENT, None)?;
+
+// Keep `bo` alive until the page flip completes. Drop it inside
+// the page flip event handler to release the buffer back to GBM.
+```
+
+---
+
+## Front Buffer Protocol
+
+The correct rendering loop with `Surface<T>` follows a strict ordering. Deviating from it can result in undefined behavior or visual corruption.
+
+1. **Check `has_free_buffers()`** — only proceed if `true`. If `false`, wait for an in-flight page flip to complete.
+2. **Bind the GBM surface as an EGL surface** — call `eglMakeCurrent` with the EGL surface backed by this `Surface<T>`.
+3. **Render with OpenGL ES** — issue your draw calls as normal.
+4. **Call `eglSwapBuffers`** — present the rendered image to the front buffer.
+5. **Call `lock_front_buffer()`** — obtain a `BufferObject<T>` representing the rendered frame.
+6. **Create a DRM framebuffer** — pass the `BufferObject<T>` to `add_framebuffer` (or equivalent) to get a framebuffer handle.
+7. **Issue a page flip** — schedule the framebuffer on the CRTC with `page_flip`.
+8. **In the page flip completion callback: drop the old `BufferObject<T>`** — dropping it releases the GBM lock and returns the buffer to the free pool, making `has_free_buffers()` return `true` again.
+
+This loop is driven entirely by DRM page flip events; never loop unconditionally or you risk starving the buffer pool.
+
+---
+
+## AsRaw for EGL Integration
+
+`Surface<T>` implements `AsRaw<gbm_surface>`, which provides the raw `*const gbm_surface` pointer required when registering the surface as a native window with EGL.
+
+```rust
+use gbm::AsRaw;
+
+// surface: Surface<T> created from your Device.
+let raw_surface: *const gbm_sys::gbm_surface = surface.as_raw();
+
+// Pass to eglCreateWindowSurface as the NativeWindowType argument.
+// The cast to *mut _ is required by the EGL C API.
+let egl_surface = egl.create_window_surface(
+    egl_display,
+    egl_config,
+    raw_surface as *mut std::ffi::c_void,
+    None,
+)?;
+```
+
+The raw pointer remains valid for the entire lifetime of the `Surface<T>` value. Do not store it beyond that lifetime.

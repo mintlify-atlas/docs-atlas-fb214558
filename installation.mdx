@@ -1,0 +1,107 @@
+---
+title: "Installing gbm.rs in Your Rust Project"
+sidebarTitle: "Installation"
+description: "Add gbm.rs to your Cargo project, choose the right feature flags, and ensure libgbm is available on your system for GPU buffer management."
+---
+
+gbm.rs links against the system-provided `libgbm` shared library, so before adding it to your `Cargo.toml` you need a Linux system with a DRM-capable GPU, the GBM development headers installed, and a working Rust toolchain. The crate targets stable Rust (edition 2021) and is only useful on Linux, where the DRM/KMS kernel subsystem and a compatible Mesa or vendor driver are present.
+
+<Steps>
+
+  <Step title="Install system prerequisites">
+    gbm.rs builds a native C extension (`gbm-sys`) that links against `libgbm`. You must install the GBM development package for your distribution before `cargo build` will succeed.
+
+    **Debian / Ubuntu**
+    ```bash
+    sudo apt-get install libgbm-dev
+    ```
+
+    **Fedora / RHEL**
+    ```bash
+    sudo dnf install mesa-libgbm-devel
+    ```
+
+    **Arch Linux**
+    ```bash
+    sudo pacman -S mesa
+    ```
+
+    Verify the library is discoverable by `pkg-config`:
+    ```bash
+    pkg-config --modversion gbm
+    ```
+
+    A version string such as `23.3.5` confirms that `libgbm` is correctly installed.
+  </Step>
+
+  <Step title="Add gbm.rs to Cargo.toml">
+    Open your project's `Cargo.toml` and add gbm.rs under `[dependencies]`:
+
+    ```toml
+    [dependencies]
+    gbm = "0.18.0"
+    ```
+
+    This pulls in gbm.rs with its **default feature set** (`import-wayland`, `import-egl`, and `drm-support`), which is suitable for most compositor and display-server projects.
+
+    If you also need to call DRM mode-setting APIs directly from your code, add drm-rs as well:
+
+    ```toml
+    [dependencies]
+    gbm = "0.18.0"
+    drm = "0.14.0"
+    ```
+  </Step>
+
+  <Step title="Configure optional feature flags">
+    gbm.rs exposes several Cargo feature flags that control which parts of the API are compiled in. You can opt out of the defaults and selectively re-enable only what you need:
+
+    ```toml
+    [dependencies.gbm]
+    version = "0.18.0"
+    default-features = false
+    features = ["drm-support", "import-egl"]
+    ```
+
+    ### Feature reference
+
+    | Feature | Default | Description |
+    |---|---|---|
+    | `import-wayland` | ✅ | Enables `Device::import_buffer_object_from_wayland`. Requires the `wayland-server` 0.31 crate. Pulls in `wayland-backend` with the `server_system` feature. |
+    | `import-egl` | ✅ | Enables `Device::import_buffer_object_from_egl` and the `EGLImage` type alias (`*mut libc::c_void`). No extra crate dependencies. |
+    | `drm-support` | ✅ | Implements `drm::Device`, `drm::control::Device`, `drm::buffer::Buffer`, and `drm::buffer::PlanarBuffer` for `Device<T>` and `BufferObject<T>` respectively. Requires drm-rs 0.14. |
+    | `use_bindgen` | ❌ | Regenerates the low-level FFI bindings from the system `gbm.h` header at build time using `bindgen`. Use this when building against a libgbm version that has additions not covered by the pre-generated bindings. |
+    | `serde` | ❌ | Derives `serde::Serialize` and `serde::Deserialize` for `BufferObjectFlags`. Requires serde 1.0.103 or later. |
+
+    ### Minimal build (no Wayland, no EGL)
+
+    If you are building a headless tool, a testing harness, or an application that only needs DRM/KMS with CPU-mapped buffers, you can strip the build down to its essentials:
+
+    ```toml
+    [dependencies.gbm]
+    version = "0.18.0"
+    default-features = false
+    features = ["drm-support"]
+    ```
+
+    ### Enabling serde support
+
+    To serialize `BufferObjectFlags` (for example, to store display configuration in a JSON or TOML file), enable the `serde` feature:
+
+    ```toml
+    [dependencies.gbm]
+    version = "0.18.0"
+    features = ["serde"]   # adds to the default set
+    ```
+
+    ```toml
+    [dependencies]
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Step>
+
+</Steps>
+
+<Note>
+  gbm.rs links against `-lgbm` at compile time via `gbm-sys`, its internal `-sys` sub-crate. If `libgbm` is not found as a system library, the build will fail with a linker error. There is no pure-Rust fallback — a working Mesa installation (or vendor equivalent) is required on the build host as well as the deployment target.
+</Note>

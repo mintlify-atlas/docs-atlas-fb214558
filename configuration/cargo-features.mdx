@@ -1,0 +1,92 @@
+---
+title: "Cargo Feature Flags for gbm.rs"
+sidebarTitle: "Cargo Features"
+description: "Configure gbm.rs with Cargo feature flags to enable Wayland buffer import, EGL image import, DRM trait implementations, serde support, and bindgen."
+---
+
+gbm.rs uses Cargo feature flags to make optional integrations opt-in, keeping compile times and dependency trees lean for projects that only need a subset of the library's capabilities. Three features are enabled by default to cover the most common use cases, while additional features for serialization and runtime binding generation remain opt-in.
+
+<Tip>
+  The default feature set — `import-wayland`, `import-egl`, and `drm-support` — covers the vast majority of use cases. You only need to customize features if you want a smaller dependency tree or need `serde` serialization support.
+</Tip>
+
+## Default Features
+
+The following features are active unless you disable defaults with `default-features = false`.
+
+<CardGroup cols={1}>
+  <Card title="import-wayland" icon="water">
+    Enables `Device::import_buffer_object_from_wayland`, which imports a Wayland `wl_buffer` directly into a GBM buffer object. Pulls in the `wayland-server 0.31` and `wayland-backend 0.3` (with the `server_system` feature) crates.
+  </Card>
+  <Card title="import-egl" icon="image">
+    Enables `Device::import_buffer_object_from_egl` and the `EGLImage` type alias, allowing GBM buffer objects to be imported from EGL image handles. This feature adds no additional crate dependencies — it only gates the relevant API surface.
+  </Card>
+  <Card title="drm-support" icon="microchip">
+    Implements `drm::Device` and `drm::control::Device` on `Device<T>`, and `drm::buffer::Buffer` and `drm::buffer::PlanarBuffer` on `BufferObject<T>`. Requires the `drm 0.14` crate.
+  </Card>
+</CardGroup>
+
+## Optional Features
+
+These features are **not** enabled by default and must be requested explicitly.
+
+<CardGroup cols={1}>
+  <Card title="use_bindgen" icon="code">
+    Regenerates the raw FFI bindings at build time by running `bindgen` against the system `gbm.h` header. Useful when targeting a custom or newer version of libgbm that differs from the pre-generated bindings shipped with gbm-sys. See the [Bindgen](/configuration/bindgen) page for full details.
+  </Card>
+  <Card title="serde" icon="brackets-curly">
+    Derives `serde::Serialize` and `serde::Deserialize` for `BufferObjectFlags`, making it possible to round-trip flags through any serde-compatible format (JSON, TOML, etc.). Adds `serde 1.0.103` with the `derive` feature and also enables `bitflags/serde`.
+  </Card>
+</CardGroup>
+
+<Note>
+  `drm 0.14.0` is always present as a **dev-dependency**, regardless of feature flags, so that integration tests can exercise DRM functionality without requiring end-users to enable `drm-support`.
+</Note>
+
+## Dependency Summary
+
+| Feature | Crates Added | Enabled by Default |
+|---|---|---|
+| `import-wayland` | `wayland-server 0.31`, `wayland-backend 0.3` | ✅ |
+| `import-egl` | *(none)* | ✅ |
+| `drm-support` | `drm 0.14` | ✅ |
+| `use_bindgen` | `bindgen 0.69`, `proc-macro2`, `regex` | ❌ |
+| `serde` | `serde 1.0.103` | ❌ |
+
+## Configuration Examples
+
+### 1. Default (Recommended)
+
+Accept all three default features — nothing extra is required in `Cargo.toml`.
+
+```toml
+[dependencies]
+gbm = "0.18.0"
+```
+
+### 2. Minimal — No Default Features
+
+Strip all optional dependencies for a bare-bones GBM device and buffer object API.
+
+```toml
+[dependencies]
+gbm = { version = "0.18.0", default-features = false }
+```
+
+### 3. DRM Support and Serde Only
+
+Enable only the DRM trait implementations and serde serialization, without Wayland or EGL dependencies.
+
+```toml
+[dependencies]
+gbm = { version = "0.18.0", default-features = false, features = ["drm-support", "serde"] }
+```
+
+### 4. All Features
+
+Enable every available feature, including runtime bindgen regeneration.
+
+```toml
+[dependencies]
+gbm = { version = "0.18.0", features = ["drm-support", "import-wayland", "import-egl", "serde", "use_bindgen"] }
+```

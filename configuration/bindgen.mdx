@@ -1,0 +1,139 @@
+---
+title: "Regenerating gbm.rs FFI Bindings with Bindgen"
+sidebarTitle: "Bindgen"
+description: "Use the use_bindgen feature to regenerate gbm.rs FFI bindings from the system gbm.h header, useful for custom libgbm versions or new platform support."
+---
+
+gbm.rs ships pre-generated FFI bindings in `gbm-sys/src/bindings.rs`, produced by **rust-bindgen 0.69** from the bundled `gbm-sys/include/gbm.h` header. For most projects these pre-generated bindings are the right choice — they build instantly with no additional system tooling required. When you need to target a custom or newer version of libgbm, however, the `use_bindgen` feature lets you regenerate the bindings at build time directly from your system's `gbm.h`.
+
+## Sub-Features
+
+The `gbm-sys` crate exposes two related feature flags that the top-level `gbm` crate surface through its own `use_bindgen` feature.
+
+<CardGroup cols={2}>
+  <Card title="use_bindgen" icon="arrows-rotate">
+    Compiles `bindgen 0.69` as a build-dependency and runs it during `cargo build` to regenerate `bindings.rs` from `gbm-sys/include/gbm.h`. The result is written to Cargo's `OUT_DIR` and compiled from there — your source tree is untouched.
+  </Card>
+  <Card title="update_bindings" icon="floppy-disk">
+    A superset of `use_bindgen`. After regenerating, the build script also **copies** the freshly generated `bindings.rs` back into `gbm-sys/src/bindings.rs`, permanently updating the file that is committed to source control. Activate this on `gbm-sys` directly when you want to refresh the shipped pre-generated bindings.
+  </Card>
+</CardGroup>
+
+<Warning>
+  `update_bindings` overwrites `gbm-sys/src/bindings.rs` in your source tree. Commit the result deliberately — it changes the pre-generated bindings that all other users of the crate will receive.
+</Warning>
+
+## Enabling Bindgen
+
+Enable the feature from your project's `Cargo.toml` by activating `use_bindgen` on the top-level `gbm` crate. This propagates automatically to `gbm-sys`.
+
+```toml
+[dependencies]
+gbm = { version = "0.18.0", features = ["use_bindgen"] }
+```
+
+To also update the committed `src/bindings.rs` inside `gbm-sys` itself (e.g. when preparing a new release of the crate), enable the feature on `gbm-sys` directly:
+
+```toml
+[dependencies]
+gbm-sys = { version = "0.4.0", features = ["update_bindings"] }
+```
+
+## Prerequisites
+
+Before building with `use_bindgen`, ensure that **Clang** and **libclang** are installed on your system. Bindgen requires them to parse C headers.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install clang libclang-dev
+
+# Fedora / RHEL
+sudo dnf install clang clang-devel
+
+# Arch Linux
+sudo pacman -S clang
+
+# macOS (via Homebrew)
+brew install llvm
+```
+
+<Note>
+  On macOS you may also need to export `LIBCLANG_PATH` pointing to the LLVM `lib` directory so that bindgen can locate `libclang.dylib`.
+</Note>
+
+## Build Script Logic
+
+When `use_bindgen` is active, `gbm-sys/build.rs` performs the following steps at compile time:
+
+<Steps>
+  <Step title="Include the GBM header">
+    The build script instructs bindgen to search the `include/` directory (via `-Iinclude`) and opens `gbm.h` as the root header.
+
+    ```rust
+    const INCLUDES: &[&str] = &["gbm.h"];
+    ```
+  </Step>
+  <Step title="Rebind GBM_BO_IMPORT_* macros as constants">
+    Several GBM import-type identifiers are defined as C preprocessor macros. Bindgen cannot emit typed constants for macros directly, so the build script redefines each one as a proper `unsigned int` constant before unbinding and re-exposing it.
+
+    ```rust
+    const MACROS: &[&str] = &[
+        "GBM_BO_IMPORT_WL_BUFFER",
+        "GBM_BO_IMPORT_EGL_IMAGE",
+        "GBM_BO_IMPORT_FD",
+        "GBM_BO_IMPORT_FD_MODIFIER",
+    ];
+    ```
+
+    The `rebind_macro` helper captures the macro value into a temporary constant, undefines the macro, then redeclares it as a named constant — making it visible to bindgen's allowlist.
+  </Step>
+  <Step title="Configure and run bindgen">
+    The builder is configured with an allowlist that restricts output to only the GBM-related items, then generates bindings into Cargo's `OUT_DIR`.
+
+    ```rust
+    let generated = bindgen::builder()
+        .clang_arg("-Iinclude")
+        .header_contents("bindings.h", &create_header())
+        .blocklist_type(TMP_BIND_PREFIX_REG)   // remove temporary rebinding helpers
+        .ctypes_prefix("libc")
+        .allowlist_type("^gbm_.*$")
+        .allowlist_function("^gbm_.*$")
+        .allowlist_var("GBM_.*|gbm_.*")
+        .constified_enum_module("^gbm_.*$")
+        .layout_tests(false)
+        .generate()
+        .unwrap();
+    ```
+  </Step>
+  <Step title="Write (and optionally copy back) the bindings">
+    The generated bindings are written to `$OUT_DIR/bindings.rs`. If the `update_bindings` feature is also active, a second step copies that file to `src/bindings.rs` in the crate source tree.
+
+    ```rust
+    generated.write_to_file(dest_path).unwrap();
+
+    #[cfg(feature = "update_bindings")]
+    {
+        fs::copy(bind_file, dest_file).unwrap();
+    }
+    ```
+  </Step>
+</Steps>
+
+## Generated Items
+
+The bindgen configuration produces the following categories of Rust items:
+
+| Allowlist Pattern | What Is Generated |
+|---|---|
+| `^gbm_.*$` (types) | Structs, unions, and typedefs for GBM objects (`gbm_device`, `gbm_bo`, `gbm_surface`, etc.) |
+| `^gbm_.*$` (functions) | All public GBM API functions (`gbm_create_device`, `gbm_bo_create`, `gbm_surface_lock_front_buffer`, …) |
+| `GBM_.*\|gbm_.*` (vars) | Top-level constants and the rebound `GBM_BO_IMPORT_*` values |
+| `^gbm_.*$` (enums) | GBM enumerations emitted as `constified_enum_module` — each variant becomes an associated constant inside a module, giving namespaced integer constants |
+
+<Note>
+  Layout tests are explicitly disabled with `.layout_tests(false)`. Bindgen's generated layout assertions are architecture-specific and would produce incorrect results — or fail to compile — when the bindings are used on an architecture different from the one where they were generated.
+</Note>
+
+<Tip>
+  For faster, reproducible builds, rely on the pre-generated bindings (no feature flag needed). Enable `use_bindgen` only when integrating with a non-standard libgbm build or when contributing an update to the shipped `src/bindings.rs`.
+</Tip>

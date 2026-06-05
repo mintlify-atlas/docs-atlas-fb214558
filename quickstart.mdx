@@ -1,47 +1,171 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with gbm.rs: Allocate and Display a Buffer"
+sidebarTitle: "Quickstart"
+description: "Learn how to allocate a GPU buffer with gbm.rs, write pixel data to it, and display it on screen using DRM/KMS in five steps."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through the complete path from opening a DRM device to displaying a GPU-allocated buffer on a connected monitor. You will open `/dev/dri/card0`, wrap it in a GBM device, allocate a 1280×720 scanout buffer, fill it with pixel data from the CPU, and hand it to the DRM/KMS subsystem as a framebuffer. The full example requires the default feature set (`drm-support`, `import-wayland`, `import-egl`). Add gbm.rs and drm-rs to your `Cargo.toml` before running this code.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+```toml
+[dependencies]
+gbm = "0.18.0"
+drm = "0.14.0"
+```
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+  <Step title="Open the DRM device">
+    GBM needs a file descriptor pointing to an open DRM device node. The simplest way is to open `/dev/dri/card0` with read/write permissions using `std::fs::OpenOptions`. In a real compositor you would enumerate available nodes or accept a file descriptor passed in by a display manager, but for this guide a direct open is sufficient.
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+    You also need to implement the drm-rs marker traits on a newtype wrapper so that GBM can recognise the file as a DRM device:
 
-    ```bash
-    your-cli start
+    ```rust
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::io::{AsFd, BorrowedFd};
+
+    use drm::control::Device as ControlDevice;
+    use drm::Device as BasicDevice;
+
+    /// A minimal newtype that wraps a DRM device file.
+    struct Card(File);
+
+    impl AsFd for Card {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+
+    // These marker trait impls are required by drm-rs and gbm.rs.
+    impl BasicDevice for Card {}
+    impl ControlDevice for Card {}
+
+    fn open_drm_device() -> Card {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/card0")
+            .expect("Failed to open DRM device");
+        Card(file)
+    }
     ```
+
+    <Tip>
+      See [/guides/drm-integration](/guides/drm-integration) for a production-ready DRM device wrapper that handles device enumeration, capability probing, and graceful error handling.
+    </Tip>
   </Step>
+
+  <Step title="Create a GBM Device">
+    Pass the open DRM file to `Device::new`. GBM takes ownership of the file descriptor (through the `AsFd` implementation) and negotiates with the kernel driver to set up the buffer manager. The call returns an `IoResult<Device<Card>>`, so you can unwrap or propagate the error with `?`.
+
+    ```rust
+    use gbm::Device;
+
+    let drm = open_drm_device();
+    let gbm = Device::new(drm).expect("Failed to create GBM device");
+
+    // Print the driver backend name, e.g. "i915", "amdgpu", "virtio_gpu"
+    println!("GBM backend: {}", gbm.backend_name());
+    ```
+
+    `Device<T>` implements `Deref<Target = T>`, so you can call any drm-rs method directly on `gbm` — mode-setting calls such as `resource_handles()`, `get_connector()`, and `set_crtc()` are all available on the same handle.
+  </Step>
+
+  <Step title="Allocate a BufferObject">
+    Use `Device::create_buffer_object` to allocate GPU memory. You supply the width, height, pixel format, and a set of usage flags. The `SCANOUT` flag tells the driver that this buffer will be presented to a display controller; `WRITE` allows CPU writes via `BufferObject::write`.
+
+    ```rust
+    use gbm::{BufferObjectFlags, Format};
+
+    let mut bo = gbm
+        .create_buffer_object::<()>(
+            1280,
+            720,
+            Format::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::WRITE,
+        )
+        .expect("Failed to allocate buffer object");
+
+    println!(
+        "Allocated {}x{} buffer, stride {} bytes, format {:?}",
+        bo.width(),
+        bo.height(),
+        bo.stride(),
+        bo.format(),
+    );
+    ```
+
+    The generic type parameter `<()>` is the userdata type. Pass any `'static` type here to attach application-defined metadata to the buffer; `()` means no userdata. Use `Device::is_format_supported` beforehand if you need to confirm that the driver supports a particular format and flag combination.
+  </Step>
+
+  <Step title="Write pixel data">
+    Because the buffer was allocated with `BufferObjectFlags::WRITE`, you can push raw pixel data from the CPU using `BufferObject::write`. The slice you pass must be exactly the right size for the buffer's width, height, and stride.
+
+    The example below generates a simple vertical stripe pattern in ARGB8888 format (4 bytes per pixel):
+
+    ```rust
+    // Build a pixel buffer: alternating black and white vertical stripes.
+    let pixel_data: Vec<u8> = (0..1280)
+        .flat_map(|x| {
+            let byte = if x % 2 == 0 { 0u8 } else { 255u8 };
+            // Repeat the same byte for all 720 rows of this column.
+            std::iter::repeat(byte).take(720)
+        })
+        .collect();
+
+    bo.write(&pixel_data).expect("Failed to write pixel data");
+    ```
+
+    <Note>
+      For real rendering workloads you would typically use EGL or Vulkan to render into the buffer on the GPU rather than writing pixel data from the CPU. CPU writes through `write()` are slower and may involve cache flushes depending on the driver.
+    </Note>
+  </Step>
+
+  <Step title="Create a framebuffer and display">
+    With the pixel data in place, register the buffer object as a DRM framebuffer and then set it as the active framebuffer for a CRTC. Because `Device<Card>` implements `drm::control::Device` (via the `drm-support` feature), you can call `add_framebuffer` and `set_crtc` directly on `gbm`.
+
+    ```rust
+    use drm::control::{self, connector, crtc};
+
+    // Register the buffer as a KMS framebuffer (depth=32, bpp=32 for ARGB8888).
+    let fb = gbm
+        .add_framebuffer(&bo, 32, 32)
+        .expect("Failed to create framebuffer");
+
+    // Enumerate resources to find a usable connector and CRTC.
+    let res = gbm.resource_handles().expect("Failed to get DRM resources");
+    let con_handle = *res.connectors().iter().next().expect("No connectors found");
+    let crtc_handle = *res.crtcs().iter().next().expect("No CRTCs found");
+
+    // Pick the first mode advertised by the connector.
+    let connector_info = gbm
+        .get_connector(con_handle, false)
+        .expect("Failed to get connector info");
+    let mode = connector_info.modes()[0];
+
+    // Activate the CRTC with our framebuffer.
+    gbm.set_crtc(crtc_handle, Some(fb), (0, 0), &[con_handle], Some(mode))
+        .expect("Failed to set CRTC");
+
+    println!("Buffer is now displayed on the connected monitor.");
+    ```
+
+    <Note>
+      This step requires the **`drm-support`** feature (enabled by default). Without it, `add_framebuffer` and `set_crtc` are not available on `Device`. If you disabled default features, re-enable it with `features = ["drm-support"]` in your `Cargo.toml`.
+    </Note>
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Next Steps
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+<CardGroup cols={3}>
+  <Card title="Core Concepts" icon="book-open" href="/concepts/gbm-overview">
+    Dive deeper into GBM devices, buffer objects, surfaces, formats, and modifiers.
+  </Card>
+  <Card title="DRM Integration" icon="layers" href="/guides/drm-integration">
+    Build a complete DRM device wrapper with connector enumeration and page-flipping.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/device">
+    Explore the full `Device`, `BufferObject`, and `Surface` API documentation.
+  </Card>
+</CardGroup>

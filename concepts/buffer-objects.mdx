@@ -1,0 +1,253 @@
+---
+title: "Buffer Objects: GPU Memory Allocation in gbm.rs"
+sidebarTitle: "Buffer Objects"
+description: "BufferObject<T> represents a GPU-allocated buffer. Learn how to create, inspect, map, write, and attach userdata to buffer objects in gbm.rs."
+---
+
+`BufferObject<T>` is the fundamental unit of GPU memory in gbm.rs. Each instance represents a contiguous region of GPU-accessible memory — a framebuffer backing store, a cursor plane image, an import target for a shared DMA-BUF, or any other driver-managed pixel buffer. The type is generic over `T`, which lets you attach arbitrary Rust values to a buffer as *userdata*, tying domain-specific state (like a cached framebuffer handle) directly to the object that needs it.
+
+## The Generic Parameter `T`
+
+The `T` in `BufferObject<T>` represents user-controlled payload stored inside the buffer object. libgbm provides `gbm_bo_set_user_data` / `gbm_bo_get_user_data` for exactly this purpose. gbm.rs boxes the value, stores the pointer through the C API, and registers a C destructor that reconstructs and drops the `Box<T>` when the buffer object is freed — even if that happens from within libgbm. When you do not need userdata, use `BufferObject<()>`.
+
+## Creation
+
+All creation methods live on `Device<T>`. They accept at minimum a width, height, pixel format, and usage flags.
+
+### `create_buffer_object`
+
+The basic allocation path. Lets the driver choose the buffer layout (tiling, compression) freely.
+
+```rust
+use gbm::{Device, Format, BufferObjectFlags};
+use std::fs::File;
+
+let file = File::options().read(true).write(true).open("/dev/dri/card0")?;
+let gbm = Device::new(file)?;
+
+let bo = gbm.create_buffer_object::<()>(
+    1920,                    // width in pixels
+    1080,                    // height in pixels
+    Format::Xrgb8888,        // pixel format
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+### `create_buffer_object_with_modifiers`
+
+Passes an explicit list of DRM format modifiers. The driver picks the first modifier from the list that it supports. Use this when you have negotiated modifiers with EGL or another API and need the buffer layout to match.
+
+```rust
+use gbm::Modifier;
+
+let modifiers = [Modifier::Linear];
+let bo = gbm.create_buffer_object_with_modifiers::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    modifiers.iter().copied(),
+)?;
+```
+
+### `create_buffer_object_with_modifiers2`
+
+Combines explicit modifiers with usage flags. This is the most expressive creation method and maps directly to `gbm_bo_create_with_modifiers2`.
+
+```rust
+let bo = gbm.create_buffer_object_with_modifiers2::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    modifiers.iter().copied(),
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+## `BufferObjectFlags`
+
+Flags communicate the intended use of the buffer to the driver. They are a `bitflags` type so you can combine them with `|`.
+
+| Flag | Meaning |
+|---|---|
+| `SCANOUT` | Buffer will be presented to the screen via KMS/DRM. Driver may apply display-compatible tiling. |
+| `CURSOR` | Buffer will be used as a hardware cursor plane. |
+| `RENDERING` | Buffer will be used as a render target (e.g. OpenGL color attachment). |
+| `WRITE` | Buffer supports direct CPU writes via `BufferObject::write()`. |
+| `LINEAR` | Buffer must be allocated with a linear (non-tiled) layout. |
+| `PROTECTED` | Buffer contents are protected from CPU access (secure video path). |
+
+<Note>
+  `CURSOR_64X64` is deprecated — use `CURSOR` instead.
+</Note>
+
+## Inspecting a Buffer Object
+
+Once allocated, a `BufferObject` exposes a comprehensive set of read-only accessors:
+
+```rust
+println!("Size:        {}×{}", bo.width(), bo.height());
+println!("Stride:      {} bytes/row", bo.stride());
+println!("Format:      {:?}", bo.format());
+println!("Bits/pixel:  {}", bo.bpp());
+println!("Planes:      {}", bo.plane_count());
+println!("Modifier:    {:?}", bo.modifier());
+
+// Per-plane information (multi-plane formats like NV12)
+for plane in 0..bo.plane_count() as i32 {
+    println!(
+        "  Plane {}: stride={} offset={}",
+        plane,
+        bo.stride_for_plane(plane),
+        bo.offset(plane),
+    );
+}
+```
+
+### Full Accessor Reference
+
+| Method | Returns | Description |
+|---|---|---|
+| `width()` | `u32` | Buffer width in pixels |
+| `height()` | `u32` | Buffer height in pixels |
+| `stride()` | `u32` | Row stride in bytes for plane 0 |
+| `stride_for_plane(plane)` | `u32` | Row stride for a given plane |
+| `format()` | `Format` | DRM FourCC pixel format |
+| `bpp()` | `u32` | Bits per pixel |
+| `offset(plane)` | `u32` | Byte offset of a plane from the buffer start |
+| `plane_count()` | `u32` | Number of planes in this buffer |
+| `modifier()` | `Modifier` | DRM format modifier describing tiling layout |
+
+## DMA-BUF and Platform Handles
+
+### `fd()` and `fd_for_plane()`
+
+Export the buffer as a DMA-BUF (PRIME) file descriptor. Each call creates a **new** `OwnedFd`; the caller is responsible for closing it. Returns `Err(InvalidFdError)` if the driver does not support PRIME export.
+
+```rust
+let dma_buf_fd: OwnedFd = bo.fd()?;
+
+// Multi-plane: export each plane separately
+let plane0_fd = bo.fd_for_plane(0)?;
+let plane1_fd = bo.fd_for_plane(1)?;
+```
+
+### `handle()` and `handle_for_plane()`
+
+Return the platform-specific `BufferObjectHandle` (a union over `u32`, `u64`, pointer, and signed types). The interpretation depends on the DRM driver. drm-rs consumes this value when adding a framebuffer.
+
+```rust
+let handle = bo.handle();
+// Access as u32 (common for DRM GEM handles)
+let gem_handle: u32 = unsafe { handle.u32_ };
+```
+
+## CPU Mapping
+
+GBM exposes two mapping functions that grant the CPU direct access to the GPU buffer's pixel data. Both accept a rectangular region `(x, y, width, height)` and operate through a callback, ensuring the map is always unmapped when the closure returns.
+
+### `map()` — Read-Only Access
+
+```rust
+let result = bo.map(0, 0, bo.width(), bo.height(), |mapped| {
+    println!("Map stride: {}", mapped.stride());
+    println!("First byte: {}", mapped.buffer()[0]);
+    // Return any value from the closure
+    mapped.buffer().len()
+})?;
+
+println!("Mapped {} bytes", result);
+```
+
+### `map_mut()` — Read-Write Access
+
+```rust
+bo.map_mut(0, 0, bo.width(), bo.height(), |mapped| {
+    // Fill the entire buffer with a solid colour (XRGB8888 blue)
+    for pixel in mapped.buffer_mut().chunks_mut(4) {
+        pixel[0] = 0xFF; // B
+        pixel[1] = 0x00; // G
+        pixel[2] = 0x00; // R
+        pixel[3] = 0xFF; // X
+    }
+})?;
+```
+
+`MappedBufferObject<'a, T>` implements `Deref<Target = BufferObject<T>>` so all inspection methods remain accessible inside the closure.
+
+## Direct CPU Write
+
+`write(buffer)` copies raw bytes directly into the GPU buffer without going through the CPU map API. It requires the buffer to have been created with `BufferObjectFlags::WRITE`.
+
+```rust
+// Create a WRITE-flagged buffer
+let mut bo = gbm.create_buffer_object::<()>(
+    64, 64,
+    Format::Argb8888,
+    BufferObjectFlags::CURSOR | BufferObjectFlags::WRITE,
+)?;
+
+// Fill with a solid colour
+let pixel_data: Vec<u8> = (0..64 * 64 * 4)
+    .map(|i| if i % 4 == 3 { 0xFF } else { 0x80 })
+    .collect();
+
+bo.write(&pixel_data)?;
+```
+
+<Warning>
+  `write()` copies the raw byte slice without format conversion. The data must
+  match the buffer's format, width, height, and stride exactly.
+</Warning>
+
+## Userdata
+
+`BufferObject<T>` can carry a single value of type `T` that travels with the buffer through its lifetime. This is useful for caching derived state like a DRM framebuffer handle alongside the underlying buffer object.
+
+```rust
+use gbm::{Device, Format, BufferObjectFlags};
+
+struct FramebufferId(u32);
+
+// Create a buffer and immediately attach a framebuffer handle
+let mut bo = gbm.create_buffer_object::<FramebufferId>(
+    1920, 1080, Format::Xrgb8888, BufferObjectFlags::SCANOUT,
+)?;
+
+// Returns the old value, if any
+let old = bo.set_userdata(FramebufferId(42));
+assert!(old.is_none());
+
+// Immutable borrow
+if let Some(fb) = bo.userdata() {
+    println!("Framebuffer id: {}", fb.0);
+}
+
+// Mutable borrow
+if let Some(fb) = bo.userdata_mut() {
+    fb.0 += 1;
+}
+
+// Take ownership — userdata is removed from the buffer
+let fb: Option<FramebufferId> = bo.take_userdata();
+
+// Discard without returning the value
+bo.set_userdata(FramebufferId(99));
+bo.clear_userdata();
+```
+
+### Userdata API Summary
+
+| Method | Description |
+|---|---|
+| `set_userdata(value)` | Store a value; returns the previous value if one was set. |
+| `userdata()` | Borrow the stored value, or `None`. |
+| `userdata_mut()` | Mutably borrow the stored value, or `None`. |
+| `take_userdata()` | Remove and return the stored value, or `None`. |
+| `clear_userdata()` | Remove the stored value and drop it in place. |
+
+<Tip>
+  When the `drm-support` feature is enabled, `BufferObject<T>` implements both
+  `drm::buffer::Buffer` and `drm::buffer::PlanarBuffer`. You can pass a
+  `&BufferObject` directly to `drm::control::Device::add_framebuffer` and
+  `add_planar_framebuffer` without any manual handle extraction.
+</Tip>

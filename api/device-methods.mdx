@@ -1,0 +1,571 @@
+---
+title: "Device<T> Methods - Buffer, Surface, and Import APIs"
+sidebarTitle: "Device Methods"
+description: "Complete method reference for Device<T> in gbm.rs: backend queries, buffer object creation with modifiers, surface creation, and buffer import from Wayland, EGL, and DMA-BUF."
+---
+
+This page documents every method on `Device<T>`, organized by category. Methods are grouped into four areas: backend queries (inspecting driver capabilities), buffer object creation (allocating GPU-visible memory), surface creation (allocating scanout-backed render targets), and buffer import (wrapping foreign buffers from Wayland, EGL, and DMA-BUF sources). For type-level documentation — struct definition, trait implementations, and the `Device::new` constructor — see [Device](/api/device).
+
+---
+
+## Backend Queries
+
+These methods interrogate the GBM backend and the underlying driver for capability and format information. They take `&self` and are inexpensive to call.
+
+### `backend_name`
+
+```rust
+pub fn backend_name(&self) -> &str
+```
+
+Returns the name of the backend currently driving this GBM device, such as `"drm"`. The string is owned by the native library and lives for the duration of the device.
+
+```rust
+let name = device.backend_name();
+println!("GBM backend: {name}"); // e.g. "drm"
+```
+
+---
+
+### `is_format_supported`
+
+```rust
+pub fn is_format_supported(&self, format: Format, usage: BufferObjectFlags) -> bool
+```
+
+Queries whether the driver supports allocating a buffer with the given pixel `format` for the specified combination of `usage` flags. Always call this before allocating buffers with non-universal formats.
+
+<ParamField path="format" type="Format">
+  The DRM fourcc pixel format to test (re-exported from `drm_fourcc` as
+  `DrmFourcc`). For example `Format::Argb8888` or `Format::Xrgb8888`.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags">
+  A bitfield of intended usages such as `SCANOUT`, `RENDERING`, `WRITE`, or
+  `CURSOR`. The query returns `true` only if all requested flags are satisfiable
+  together.
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, Format};
+
+if device.is_format_supported(Format::Argb8888, BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING) {
+    println!("ARGB8888 scanout+rendering is supported");
+}
+```
+
+---
+
+### `format_modifier_plane_count`
+
+```rust
+pub fn format_modifier_plane_count(&self, format: Format, modifier: Modifier) -> Option<u32>
+```
+
+Returns the number of memory planes required for a buffer with the given `format` and tiling `modifier`. Returns `None` when the combination does not have a defined or fixed plane count — for example when `Modifier::Invalid` is passed.
+
+<ParamField path="format" type="Format">
+  The DRM fourcc pixel format to query.
+</ParamField>
+
+<ParamField path="modifier" type="Modifier">
+  The DRM format modifier (re-exported from `drm_fourcc` as `DrmModifier`)
+  representing a vendor-specific tiling layout. Pass `Modifier::Linear` for
+  linear layouts.
+</ParamField>
+
+```rust
+use gbm::{Format, Modifier};
+use drm_fourcc::DrmModifier;
+
+match device.format_modifier_plane_count(Format::Nv12, DrmModifier::Linear) {
+    Some(planes) => println!("NV12 linear uses {planes} plane(s)"),
+    None => println!("plane count is undefined for this combination"),
+}
+```
+
+---
+
+## Buffer Object Creation
+
+Buffer objects (`BufferObject<U>`) are GPU-visible memory allocations. The `U` type parameter is a user-data slot — use `()` if you do not need to attach custom metadata. All creation methods return `IoResult<BufferObject<U>>`, propagating the OS errno on failure.
+
+### `create_buffer_object`
+
+```rust
+pub fn create_buffer_object<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+Allocates a buffer object of the given dimensions and format, with the driver choosing an appropriate tiling modifier. Use this when you do not need to control the modifier explicitly.
+
+<ParamField path="width" type="u32" required>
+  Width of the buffer in pixels.
+</ParamField>
+
+<ParamField path="height" type="u32" required>
+  Height of the buffer in pixels.
+</ParamField>
+
+<ParamField path="format" type="Format" required>
+  DRM fourcc pixel format for the allocation.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags. Common combinations:
+  - `SCANOUT | WRITE` — CPU-writable scanout buffer
+  - `SCANOUT | RENDERING` — GPU-rendered scanout buffer
+  - `CURSOR` — hardware cursor plane buffer
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, Format};
+
+let bo = device.create_buffer_object::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+println!("allocated {}x{} buffer", bo.width()?, bo.height()?);
+```
+
+---
+
+### `create_buffer_object_with_modifiers`
+
+```rust
+pub fn create_buffer_object_with_modifiers<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    modifiers: impl Iterator<Item = Modifier>,
+) -> IoResult<BufferObject<U>>
+```
+
+Allocates a buffer object with an explicit list of acceptable tiling modifiers. The driver picks the best modifier from the provided list. This variant does not accept `BufferObjectFlags` — use `create_buffer_object_with_modifiers2` when you need both modifiers and usage flags.
+
+<ParamField path="modifiers" type="impl Iterator<Item = Modifier>" required>
+  An iterator of acceptable DRM format modifiers. The driver selects the first
+  modifier from the list it supports. Commonly sourced from a compositor's DMA-BUF
+  feedback or from `drmGetFormatModifierPlaneCount`.
+</ParamField>
+
+```rust
+use drm_fourcc::DrmModifier;
+use gbm::Format;
+
+let modifiers = [DrmModifier::Linear, DrmModifier::Invalid];
+let bo = device.create_buffer_object_with_modifiers::<()>(
+    1280,
+    720,
+    Format::Argb8888,
+    modifiers.into_iter(),
+)?;
+```
+
+---
+
+### `create_buffer_object_with_modifiers2`
+
+```rust
+pub fn create_buffer_object_with_modifiers2<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    modifiers: impl Iterator<Item = Modifier>,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+Allocates a buffer object with both an explicit modifier list **and** usage flags. This is the most expressive buffer creation method, combining the flexibility of modifier negotiation with the driver hints conveyed by `BufferObjectFlags`.
+
+<ParamField path="modifiers" type="impl Iterator<Item = Modifier>" required>
+  An iterator of acceptable DRM format modifiers.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags passed alongside the modifier hint.
+</ParamField>
+
+```rust
+use drm_fourcc::DrmModifier;
+use gbm::{BufferObjectFlags, Format};
+
+let supported_mods: Vec<DrmModifier> = vec![DrmModifier::Linear];
+let bo = device.create_buffer_object_with_modifiers2::<()>(
+    1280,
+    720,
+    Format::Argb8888,
+    supported_mods.into_iter(),
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+---
+
+## Surface Creation
+
+A `Surface<U>` wraps a GBM surface used as the backing store for an EGL window surface or similar render target. The API mirrors buffer object creation closely, with the same modifier-based variants.
+
+### `create_surface`
+
+```rust
+pub fn create_surface<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+) -> IoResult<Surface<U>>
+```
+
+Allocates a GBM surface. The surface provides a series of buffer objects that EGL renders into, which can then be locked and scanned out.
+
+<ParamField path="width" type="u32" required>
+  Width of the surface in pixels.
+</ParamField>
+
+<ParamField path="height" type="u32" required>
+  Height of the surface in pixels.
+</ParamField>
+
+<ParamField path="format" type="Format" required>
+  DRM fourcc pixel format for the surface buffers.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the surface's buffer objects.
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, Format};
+
+let surface = device.create_surface::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+---
+
+### `create_surface_with_modifiers`
+
+```rust
+pub fn create_surface_with_modifiers<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    modifiers: impl Iterator<Item = Modifier>,
+) -> IoResult<Surface<U>>
+```
+
+Allocates a GBM surface with an explicit list of acceptable tiling modifiers. The driver selects the best supported modifier from the list.
+
+<ParamField path="modifiers" type="impl Iterator<Item = Modifier>" required>
+  An iterator of acceptable DRM format modifiers for the surface's backing
+  buffer objects.
+</ParamField>
+
+```rust
+use drm_fourcc::DrmModifier;
+use gbm::Format;
+
+let mods = [DrmModifier::Linear];
+let surface = device.create_surface_with_modifiers::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    mods.into_iter(),
+)?;
+```
+
+---
+
+### `create_surface_with_modifiers2`
+
+```rust
+pub fn create_surface_with_modifiers2<U: 'static>(
+    &self,
+    width: u32,
+    height: u32,
+    format: Format,
+    modifiers: impl Iterator<Item = Modifier>,
+    usage: BufferObjectFlags,
+) -> IoResult<Surface<U>>
+```
+
+Allocates a GBM surface with both explicit modifiers and usage flags, giving the driver the most information to make an optimal allocation decision.
+
+<ParamField path="modifiers" type="impl Iterator<Item = Modifier>" required>
+  An iterator of acceptable DRM format modifiers.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the surface's buffer objects.
+</ParamField>
+
+```rust
+use drm_fourcc::DrmModifier;
+use gbm::{BufferObjectFlags, Format};
+
+let mods = [DrmModifier::Linear];
+let surface = device.create_surface_with_modifiers2::<()>(
+    1920,
+    1080,
+    Format::Xrgb8888,
+    mods.into_iter(),
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+)?;
+```
+
+---
+
+## Buffer Import
+
+These methods import foreign buffer handles — from Wayland, EGL, or DMA-BUF — and wrap them in a `BufferObject<U>`. The resulting buffer object shares the underlying pixel memory with the foreign object but has an independent lifetime; dropping the `BufferObject` does not destroy the foreign buffer.
+
+### `import_buffer_object_from_wayland`
+
+```rust
+pub fn import_buffer_object_from_wayland<U: 'static>(
+    &self,
+    buffer: &WlBuffer,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+Imports a Wayland `wl_buffer` and wraps it as a GBM buffer object. This enables a Wayland compositor to hand a client-submitted buffer off to KMS for direct scanout without an extra copy.
+
+<Note>
+  This method is only available when the `import-wayland` Cargo feature is
+  enabled:
+
+  ```toml
+  [dependencies]
+  gbm = { version = "...", features = ["import-wayland"] }
+  ```
+</Note>
+
+<ParamField path="buffer" type="&WlBuffer" required>
+  A reference to the Wayland buffer resource submitted by a client. Sourced
+  from the `wl_buffer` protocol object via `wayland-server`.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the imported buffer object. Typically
+  `BufferObjectFlags::SCANOUT` for direct scanout.
+</ParamField>
+
+```rust
+use gbm::BufferObjectFlags;
+
+// Inside a wl_surface commit handler:
+let bo = device.import_buffer_object_from_wayland::<()>(
+    &wl_buffer,
+    BufferObjectFlags::SCANOUT,
+)?;
+```
+
+---
+
+### `import_buffer_object_from_egl`
+
+```rust
+pub unsafe fn import_buffer_object_from_egl<U: 'static>(
+    &self,
+    buffer: EGLImage,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+Imports an EGL image handle (`EGLImage`, a `*mut c_void`) and wraps it as a GBM buffer object. Useful when an EGL renderer produces an `EGLImage` that needs to be scanned out via KMS.
+
+<Warning>
+  This method is `unsafe`. Passing a null pointer or an invalid `EGLImage`
+  handle is **undefined behaviour**. The caller must guarantee that `buffer`
+  is a valid, live `EGLImage` for the duration of this call.
+</Warning>
+
+<Note>
+  Requires the `import-egl` Cargo feature:
+
+  ```toml
+  [dependencies]
+  gbm = { version = "...", features = ["import-egl"] }
+  ```
+</Note>
+
+<ParamField path="buffer" type="EGLImage (*mut c_void)" required>
+  A valid, non-null EGL image handle. The type alias `gbm::EGLImage` is
+  `*mut libc::c_void`.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the imported buffer object.
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, EGLImage};
+
+// SAFETY: `egl_image` was previously created with eglCreateImage and is valid.
+let bo = unsafe {
+    device.import_buffer_object_from_egl::<()>(
+        egl_image as EGLImage,
+        BufferObjectFlags::SCANOUT,
+    )?
+};
+```
+
+---
+
+### `import_buffer_object_from_dma_buf`
+
+```rust
+pub fn import_buffer_object_from_dma_buf<U: 'static>(
+    &self,
+    buffer: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+Imports a single-plane DMA-BUF file descriptor and wraps it as a GBM buffer object. The buffer is described by its pixel dimensions, byte stride, and pixel format. Use `import_buffer_object_from_dma_buf_with_modifiers` for multi-plane or modifier-aware imports.
+
+<ParamField path="buffer" type="BorrowedFd<'_>" required>
+  A borrowed file descriptor referencing the DMA-BUF to import. The GBM
+  driver duplicates the fd internally; the caller retains ownership of the
+  original.
+</ParamField>
+
+<ParamField path="width" type="u32" required>
+  Width of the buffer in pixels.
+</ParamField>
+
+<ParamField path="height" type="u32" required>
+  Height of the buffer in pixels.
+</ParamField>
+
+<ParamField path="stride" type="u32" required>
+  Row stride in bytes (bytes per scanline, including any padding).
+</ParamField>
+
+<ParamField path="format" type="Format" required>
+  DRM fourcc pixel format of the DMA-BUF data.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the imported buffer object.
+</ParamField>
+
+```rust
+use gbm::{BufferObjectFlags, Format};
+use std::os::unix::io::AsFd;
+
+let bo = device.import_buffer_object_from_dma_buf::<()>(
+    dma_buf_fd.as_fd(),
+    1280,
+    720,
+    1280 * 4,          // stride: width × bytes-per-pixel
+    Format::Xrgb8888,
+    BufferObjectFlags::SCANOUT,
+)?;
+```
+
+---
+
+### `import_buffer_object_from_dma_buf_with_modifiers`
+
+```rust
+pub fn import_buffer_object_from_dma_buf_with_modifiers<U: 'static>(
+    &self,
+    len: u32,
+    buffers: [Option<BorrowedFd<'_>>; 4],
+    width: u32,
+    height: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+    strides: [i32; 4],
+    offsets: [i32; 4],
+    modifier: Modifier,
+) -> IoResult<BufferObject<U>>
+```
+
+Imports a multi-plane DMA-BUF with an explicit tiling modifier. The `buffers` array holds up to four plane file descriptors (`None` entries are passed to libgbm as `-1`). This is the correct import path for tiled formats such as NV12 and for any buffer whose modifier was negotiated via DMA-BUF feedback.
+
+<ParamField path="len" type="u32" required>
+  The number of valid (non-`None`) planes present in `buffers`. Must be ≤ 4.
+</ParamField>
+
+<ParamField path="buffers" type="[Option<BorrowedFd<'_>>; 4]" required>
+  An array of exactly four slots. Fill the first `len` slots with the plane
+  file descriptors; set the remaining slots to `None`.
+</ParamField>
+
+<ParamField path="width" type="u32" required>
+  Width of the buffer in pixels.
+</ParamField>
+
+<ParamField path="height" type="u32" required>
+  Height of the buffer in pixels.
+</ParamField>
+
+<ParamField path="format" type="Format" required>
+  DRM fourcc pixel format describing the multi-plane layout.
+</ParamField>
+
+<ParamField path="usage" type="BufferObjectFlags" required>
+  Intended usage flags for the imported buffer object.
+</ParamField>
+
+<ParamField path="strides" type="[i32; 4]" required>
+  Per-plane row strides in bytes. Unused plane slots should be set to `0`.
+</ParamField>
+
+<ParamField path="offsets" type="[i32; 4]" required>
+  Per-plane byte offsets from the start of each DMA-BUF. Unused plane slots
+  should be set to `0`.
+</ParamField>
+
+<ParamField path="modifier" type="Modifier" required>
+  The DRM format modifier describing the tiling layout that applies to all
+  planes. Must match the modifier used when the buffer was originally
+  allocated.
+</ParamField>
+
+```rust
+use drm_fourcc::DrmModifier;
+use gbm::{BufferObjectFlags, Format};
+use std::os::unix::io::AsFd;
+
+// Import a two-plane NV12 buffer (Y plane + UV plane)
+let bo = device.import_buffer_object_from_dma_buf_with_modifiers::<()>(
+    2,
+    [
+        Some(y_plane_fd.as_fd()),
+        Some(uv_plane_fd.as_fd()),
+        None,
+        None,
+    ],
+    1920,
+    1080,
+    Format::Nv12,
+    BufferObjectFlags::SCANOUT,
+    [1920, 1920, 0, 0],  // strides: Y full-width, UV full-width
+    [0, 0, 0, 0],        // offsets: both planes start at offset 0
+    DrmModifier::Linear,
+)?;
+```

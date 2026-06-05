@@ -1,0 +1,161 @@
+---
+title: "BufferObjectFlags - GBM Buffer Usage Flags"
+sidebarTitle: "BufferObjectFlags"
+description: "Reference for the BufferObjectFlags bitflags type in gbm.rs: SCANOUT, CURSOR, RENDERING, WRITE, LINEAR, and PROTECTED control how GBM allocates GPU buffers."
+---
+
+`BufferObjectFlags` is a bitflags type passed to buffer and surface creation methods to describe the intended uses of a GBM buffer. The combination of flags you provide tells the GBM backend which memory placement, tiling strategy, and hardware paths it must support. Choosing flags that the driver cannot satisfy will cause allocation to fail, so you should always call [`Device::is_format_supported`](/api/device) to validate a format-and-flags pair before creating a buffer.
+
+## Type Definition
+
+```rust
+#[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+pub struct BufferObjectFlags: u32 { /* flag constants */ }
+```
+
+`BufferObjectFlags` is built with the [`bitflags`](https://docs.rs/bitflags) crate. It derives `Hash`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Clone`, `Copy`, and `Debug`. When the `serde` feature is enabled it also derives `Serialize` and `Deserialize` (as a transparent `u32`).
+
+---
+
+## Flags
+
+### `SCANOUT`
+
+```rust
+const SCANOUT = 1; // GBM_BO_USE_SCANOUT
+```
+
+Buffer will be presented directly to the screen via a kernel API such as KMS (Kernel Mode Setting). The backing memory must satisfy the display controller's alignment, pitch, and format constraints. Use this flag for buffers that will be passed to `drmModeAddFB` or equivalent.
+
+### `CURSOR`
+
+```rust
+const CURSOR = 2; // GBM_BO_USE_CURSOR
+```
+
+Buffer will be used as a hardware cursor plane. Cursor buffers typically must fit within a small fixed size (e.g. 64×64 pixels) and may require specific formats. Prefer this flag over the deprecated `CURSOR_64X64`.
+
+### `RENDERING`
+
+```rust
+const RENDERING = 4; // GBM_BO_USE_RENDERING
+```
+
+Buffer will be used as a render target by the GPU (e.g. attached as an EGL color buffer or Vulkan image). The backend allocates the buffer in GPU-accessible memory with the tiling layout the GPU prefers.
+
+### `WRITE`
+
+```rust
+const WRITE = 8; // GBM_BO_USE_WRITE
+```
+
+Enables CPU write access via [`BufferObject::write()`](/api/buffer-object#write). This is guaranteed to work when combined with `CURSOR`, but the outcome is driver-dependent for other flag combinations. If you need general CPU access, prefer [`BufferObject::map_mut()`](/api/buffer-object#map_mut).
+
+### `LINEAR`
+
+```rust
+const LINEAR = 16; // GBM_BO_USE_LINEAR
+```
+
+Requests a linear (non-tiled, row-major) memory layout. Linear buffers are required when the consumer reads pixel data sequentially — for example when sharing a buffer with a software renderer or a codec. Combined with `SCANOUT`, this may constrain display bandwidth on tiling-capable hardware.
+
+### `PROTECTED`
+
+```rust
+const PROTECTED = 32; // GBM_BO_USE_PROTECTED
+```
+
+Allocates the buffer in protected (encrypted) memory. Protected buffers are not readable by the CPU or by untrusted GPU clients (non-trusted OpenGL, OpenCL, and Vulkan applications). Use this for DRM-encrypted video content pipelines.
+
+### `CURSOR_64X64` *(deprecated)*
+
+```rust
+#[deprecated = "Use CURSOR instead"]
+const CURSOR_64X64 = 2; // GBM_BO_USE_CURSOR_64X64
+```
+
+Legacy alias for `CURSOR`, kept for backwards compatibility. The numeric value is identical; use `CURSOR` in all new code.
+
+---
+
+## Combining Flags
+
+Flags are combined with the `|` operator. The result is still a `BufferObjectFlags` value:
+
+```rust
+use gbm::BufferObjectFlags;
+
+// Buffer suitable for both display scanout and EGL rendering (the typical GBM use case)
+let flags = BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING;
+
+// CPU-writable cursor buffer
+let cursor_flags = BufferObjectFlags::CURSOR | BufferObjectFlags::WRITE;
+
+// Protected linear scanout buffer for secure video
+let secure_flags =
+    BufferObjectFlags::SCANOUT | BufferObjectFlags::LINEAR | BufferObjectFlags::PROTECTED;
+```
+
+---
+
+## Checking Format Support
+
+Before allocating a buffer, verify that the driver supports the requested format-and-flags combination with [`Device::is_format_supported`](/api/device):
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let flags = BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING;
+
+if device.is_format_supported(Format::Xrgb8888, flags) {
+    let bo = device
+        .create_buffer_object::<()>(1920, 1080, Format::Xrgb8888, flags)
+        .expect("allocation failed");
+    println!("created {}x{} scanout+rendering buffer", bo.width(), bo.height());
+} else {
+    eprintln!("driver does not support XRGB8888 with SCANOUT|RENDERING");
+}
+```
+
+---
+
+## Serde Support
+
+When the `serde` feature is enabled in `Cargo.toml`, `BufferObjectFlags` implements `Serialize` and `Deserialize` as a transparent `u32`:
+
+```toml
+# Cargo.toml
+[dependencies]
+gbm = { version = "...", features = ["serde"] }
+```
+
+```rust
+#[cfg(feature = "serde")]
+{
+    use gbm::BufferObjectFlags;
+    let flags = BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING;
+
+    let json = serde_json::to_string(&flags).unwrap();
+    assert_eq!(json, "5"); // 1 | 4
+
+    let decoded: BufferObjectFlags = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, flags);
+}
+```
+
+---
+
+<Note>
+**Common flag combinations**
+
+| Use case | Recommended flags |
+|---|---|
+| Display scanout (KMS) | `SCANOUT` |
+| GPU rendering target | `RENDERING` |
+| Scanout + EGL/Vulkan rendering | `SCANOUT \| RENDERING` |
+| Hardware cursor with CPU updates | `CURSOR \| WRITE` |
+| Software / linear-access buffer | `LINEAR` |
+| Secure encrypted video plane | `SCANOUT \| PROTECTED` |
+
+The most common pairing for a traditional compositor is `SCANOUT | RENDERING`: the GPU renders into the buffer and the display controller scans it out directly, avoiding any copies.
+</Note>

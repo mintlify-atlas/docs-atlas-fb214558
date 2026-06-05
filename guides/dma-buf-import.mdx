@@ -1,0 +1,200 @@
+---
+title: "Import DMA-BUF File Descriptors as GBM Buffer Objects"
+sidebarTitle: "DMA-BUF Import"
+description: "Import external GPU buffers shared via DMA-BUF file descriptors into GBM, enabling interop between graphics stacks, video decoders, and camera pipelines."
+---
+
+DMA-BUF is a Linux kernel mechanism that lets independent subsystems — GPU drivers, V4L2 video decoders, camera ISPs, and display controllers — share the same physical memory without any copying. A producing subsystem exports the buffer as a file descriptor; a consuming subsystem imports that file descriptor to gain its own handle to the same pages. gbm.rs exposes two import paths: `import_buffer_object_from_dma_buf` for single-plane buffers (common for RGB and packed YUV), and `import_buffer_object_from_dma_buf_with_modifiers` for multi-plane buffers with explicit layout modifiers (required for formats like NV12 or P010 produced by hardware decoders). The resulting `BufferObject` can then be used as a DRM framebuffer or sampled in an EGL shader just like any other GBM allocation.
+
+## Single-Plane Import
+
+Use `import_buffer_object_from_dma_buf` when the external buffer has a single memory plane — for example, an XRGB8888 frame from a screen capture or a YUYV camera frame.
+
+### Method Signature
+
+```rust
+pub fn import_buffer_object_from_dma_buf<U: 'static>(
+    &self,
+    buffer: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+) -> IoResult<BufferObject<U>>
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `buffer` | `BorrowedFd<'_>` | The DMA-BUF file descriptor exported by the producer. The borrow prevents use-after-close bugs. |
+| `width` | `u32` | Width of the buffer in pixels. |
+| `height` | `u32` | Height of the buffer in pixels. |
+| `stride` | `u32` | Row stride in bytes (bytes per line, including padding). |
+| `format` | `Format` | Pixel format (a `DrmFourcc` value, e.g. `Format::Xrgb8888`). |
+| `usage` | `BufferObjectFlags` | Intended usage: `SCANOUT`, `RENDERING`, or both. |
+
+### Example: Importing a Camera Buffer
+
+```rust
+use std::os::unix::io::BorrowedFd;
+use gbm::{BufferObjectFlags, Device, Format};
+use drm::control::Device as ControlDevice;
+
+fn import_camera_frame(
+    gbm: &Device<Card>,
+    // The DMA-BUF fd exported by the V4L2 driver or camera HAL.
+    dma_buf_fd: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    stride: u32,
+) {
+    // Import the single-plane XRGB8888 camera frame.
+    let bo = gbm
+        .import_buffer_object_from_dma_buf::<()>(
+            dma_buf_fd,
+            width,
+            height,
+            stride,
+            Format::Xrgb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .expect("failed to import DMA-BUF");
+
+    println!(
+        "Imported DMA-BUF: {}x{}, stride={}, modifier={:?}",
+        bo.width(),
+        bo.height(),
+        bo.stride(),
+        bo.modifier(),
+    );
+
+    // Create a DRM framebuffer and scan it out.
+    let fb = gbm
+        .add_framebuffer(&bo, 24, 32)
+        .expect("failed to create framebuffer");
+
+    // gbm.set_crtc(crtc, Some(fb), (0, 0), &[connector], Some(mode)).unwrap();
+}
+```
+
+## Multi-Plane Import with Modifiers
+
+Hardware video decoders typically produce multi-plane YUV buffers with a vendor-specific memory layout (modifier). `import_buffer_object_from_dma_buf_with_modifiers` accepts up to four planes, each with its own file descriptor, stride, and offset, along with an explicit `Modifier` describing the tiling layout.
+
+### Method Signature
+
+```rust
+pub fn import_buffer_object_from_dma_buf_with_modifiers<U: 'static>(
+    &self,
+    len: u32,
+    buffers: [Option<BorrowedFd<'_>>; 4],
+    width: u32,
+    height: u32,
+    format: Format,
+    usage: BufferObjectFlags,
+    strides: [i32; 4],
+    offsets: [i32; 4],
+    modifier: Modifier,
+) -> IoResult<BufferObject<U>>
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `len` | `u32` | Number of active planes (1–4). |
+| `buffers` | `[Option<BorrowedFd<'_>>; 4]` | One `BorrowedFd` per active plane; unused slots are `None`. |
+| `width` | `u32` | Width of the image in pixels. |
+| `height` | `u32` | Height of the image in pixels (luma plane). |
+| `format` | `Format` | Multi-planar pixel format, e.g. `Format::Nv12`. |
+| `usage` | `BufferObjectFlags` | Intended usage flags. |
+| `strides` | `[i32; 4]` | Byte stride for each plane; unused entries are `0`. |
+| `offsets` | `[i32; 4]` | Byte offset within each plane's fd; usually `0` per plane. |
+| `modifier` | `Modifier` | DRM format modifier describing the memory layout (tiling, compression). Use `Modifier::Linear` for linear buffers. |
+
+### Example: Importing an NV12 Video Frame
+
+NV12 is a biplanar YUV 4:2:0 format. The luma (Y) plane and chroma (UV) plane are often exported as separate file descriptors by hardware decoders.
+
+```rust
+use std::os::unix::io::BorrowedFd;
+use gbm::{BufferObjectFlags, Device, Format, Modifier};
+
+fn import_nv12_frame(
+    gbm: &Device<Card>,
+    y_fd: BorrowedFd<'_>,      // luma plane DMA-BUF fd
+    uv_fd: BorrowedFd<'_>,     // chroma plane DMA-BUF fd
+    width: u32,
+    height: u32,
+    y_stride: i32,
+    uv_stride: i32,
+) {
+    let bo = gbm
+        .import_buffer_object_from_dma_buf_with_modifiers::<()>(
+            2, // two active planes: Y and UV
+            [
+                Some(y_fd),   // plane 0: luma
+                Some(uv_fd),  // plane 1: chroma
+                None,         // plane 2: unused
+                None,         // plane 3: unused
+            ],
+            width,
+            height,
+            Format::Nv12,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+            [y_stride, uv_stride, 0, 0], // strides per plane
+            [0, 0, 0, 0],                // offsets (both planes start at offset 0)
+            Modifier::Linear,
+        )
+        .expect("failed to import NV12 DMA-BUF");
+
+    println!(
+        "Imported NV12 frame: {}x{} ({} planes)",
+        bo.width(),
+        bo.height(),
+        bo.plane_count(),
+    );
+}
+```
+
+## Exporting a GBM Buffer as DMA-BUF
+
+gbm.rs can also go the other direction: export a `BufferObject` as a DMA-BUF file descriptor so that other subsystems (a video encoder, a Vulkan import, another GPU) can consume it.
+
+### Single-Plane Export with `fd()`
+
+```rust
+use gbm::{BufferObjectFlags, Device, Format};
+
+let bo = gbm
+    .create_buffer_object::<()>(
+        1280,
+        720,
+        Format::Xrgb8888,
+        BufferObjectFlags::RENDERING,
+    )
+    .expect("failed to create buffer object");
+
+// Export as DMA-BUF. Each call produces a new OwnedFd.
+let dma_buf_fd = bo.fd().expect("failed to export DMA-BUF");
+// Send `dma_buf_fd` to another subsystem; it is an independent file descriptor.
+```
+
+### Per-Plane Export with `fd_for_plane()`
+
+For multi-plane buffers, export each plane individually:
+
+```rust
+let y_fd  = bo.fd_for_plane(0).expect("failed to export luma plane");
+let uv_fd = bo.fd_for_plane(1).expect("failed to export chroma plane");
+```
+
+<Note>
+  Every call to `fd()` or `fd_for_plane()` creates a brand-new `OwnedFd` backed by a fresh kernel file descriptor (via `dup` internally). The returned `OwnedFd` is independent of the `BufferObject`'s lifetime — you can keep it alive after dropping the `BufferObject`. However, each outstanding file descriptor holds a reference to the underlying DMA-BUF, preventing the memory from being freed until all file descriptors are closed.
+</Note>
+
+<Tip>
+  DMA-BUF import is the foundation of several high-value interop scenarios:
+
+  - **Video decoders (V4L2)**: Codecs such as H.264/H.265 running on the SoC VPU export decoded NV12 frames as DMA-BUF fds; import them with `import_buffer_object_from_dma_buf_with_modifiers` and display them zero-copy via KMS.
+  - **Camera pipelines**: ISP drivers export raw or processed camera frames; import them for overlay composition or GPU-based post-processing.
+  - **Inter-GPU transfer**: When a system has both an integrated and a discrete GPU, export a buffer rendered by one GPU as a DMA-BUF and import it on the other for display or further processing — avoiding expensive CPU readback.
+</Tip>
