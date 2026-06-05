@@ -1,7 +1,7 @@
 ---
-title: "BufferObjectFlags - GBM Buffer Usage Flags"
+title: "BufferObjectFlags - GBM Buffer Usage Flag Reference"
 sidebarTitle: "BufferObjectFlags"
-description: "Reference for the BufferObjectFlags bitflags type in gbm.rs: SCANOUT, CURSOR, RENDERING, WRITE, LINEAR, and PROTECTED control how GBM allocates GPU buffers."
+description: "Reference for BufferObjectFlags in gbm.rs: SCANOUT, CURSOR, RENDERING, WRITE, LINEAR, and PROTECTED flags control how libgbm allocates GPU buffers."
 ---
 
 `BufferObjectFlags` is a bitflags type passed to buffer and surface creation methods to describe the intended uses of a GBM buffer. The combination of flags you provide tells the GBM backend which memory placement, tiling strategy, and hardware paths it must support. Choosing flags that the driver cannot satisfy will cause allocation to fail, so you should always call [`Device::is_format_supported`](/api/device) to validate a format-and-flags pair before creating a buffer.

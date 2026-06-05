@@ -1,7 +1,7 @@
 ---
-title: "GBM Surfaces for EGL Rendering Pipelines"
+title: "GBM Surfaces: EGL Rendering Targets and Buffer Pools"
 sidebarTitle: "Surfaces"
-description: "Surface<T> provides an EGL-compatible rendering target backed by GBM. Understand the front buffer locking protocol and when to use surfaces vs buffer objects."
+description: "Surface<T> is a GBM rendering target for EGL pipelines. Learn the front buffer locking protocol and when to use surfaces versus buffer objects."
 ---
 
 `Surface<T>` is a GBM rendering surface — a managed pool of GPU buffers that cycles through a produce/consume loop driven by EGL and the display hardware. Its primary role is to serve as the **native window type** when creating an EGL surface on a DRM platform: you pass the raw `gbm_surface` pointer to `eglCreateWindowSurface`, and from that point EGL renders into the surface's internal buffers while your compositor code reads completed frames out of the front buffer and hands them to KMS for display.

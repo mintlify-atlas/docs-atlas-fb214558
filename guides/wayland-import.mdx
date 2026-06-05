@@ -1,7 +1,7 @@
 ---
 title: "Import Wayland Buffers into GBM for Display Composition"
 sidebarTitle: "Wayland Import"
-description: "Use gbm.rs to import WlBuffer objects from Wayland clients into GBM buffer objects, enabling display composition with DRM/KMS."
+description: "Use gbm.rs to import WlBuffer objects from Wayland clients into GBM buffer objects for zero-copy display composition and DRM/KMS scanout."
 ---
 
 When a Wayland compositor receives a buffer commit from a client, the underlying pixel memory is often already GPU-accessible — either as a GBM buffer the client allocated itself or as a DMA-BUF shared through the `zwp_linux_dmabuf_v1` protocol. Rather than copying that pixel data into a new allocation, gbm.rs provides `import_buffer_object_from_wayland`, which wraps the client's `WlBuffer` in a GBM `BufferObject` that shares the same backing memory. The resulting buffer object can then be passed directly to a DRM framebuffer or composited using EGL — without any extra allocation or copy.

@@ -1,7 +1,7 @@
 ---
-title: "BufferObject<T> - GPU Buffer Handle Reference"
+title: "BufferObject<T> - GBM GPU Buffer Handle API Reference"
 sidebarTitle: "BufferObject"
-description: "API reference for BufferObject<T> in gbm.rs: inspect dimensions, format, and modifier; map regions for CPU access; export DMA-BUF descriptors; and attach typed userdata."
+description: "BufferObject<T> reference for gbm.rs: inspect dimensions, format, and modifier; map regions for CPU access; export DMA-BUF fds; and attach typed userdata."
 ---
 
 `BufferObject<T>` represents a GPU-allocated buffer managed by libgbm. It is the central handle type in gbm.rs, wrapping a `gbm_bo` pointer and keeping the parent `gbm_device` alive for as long as the buffer exists. The type parameter `T` lets you attach arbitrary typed data to the buffer object, which libgbm stores and returns on demand. Buffer objects are created through [`Device::create_buffer_object`](/api/device) and are automatically destroyed when the last reference is dropped.

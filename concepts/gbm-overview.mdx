@@ -1,7 +1,7 @@
 ---
-title: "How the Generic Buffer Manager Works"
+title: "GBM Architecture: How the Generic Buffer Manager Works"
 sidebarTitle: "GBM Overview"
-description: "Understand the Generic Buffer Manager architecture: how GBM sits between your application, the DRM kernel subsystem, and the GPU hardware."
+description: "Understand the Generic Buffer Manager architecture: how GBM sits between your application, the DRM kernel subsystem, and the GPU hardware on Linux."
 ---
 
 The Generic Buffer Manager (GBM) is a platform abstraction layer for GPU memory allocation on Linux. It provides a hardware-agnostic API that lets graphics applications request GPU-accessible buffers without knowing which GPU driver or memory allocator sits beneath them. The `gbm.rs` crate wraps libgbm with a safe, idiomatic Rust interface, making it straightforward to integrate buffer management into Wayland compositors, DRM-based display servers, and other low-level graphics stacks.
@@ -96,8 +96,8 @@ Add `gbm` to your `Cargo.toml`, enabling the `drm-support` feature for seamless 
 
 ```toml
 [dependencies]
-gbm = { version = "0.15", features = ["drm-support"] }
-drm = "0.12"
+gbm = { version = "0.18.0", features = ["drm-support"] }
+drm = "0.14.0"
 ```
 
 Then open a DRM device and create a GBM device on top of it:

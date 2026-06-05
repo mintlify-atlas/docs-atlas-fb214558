@@ -1,7 +1,7 @@
 ---
 title: "Get Started with gbm.rs: Allocate and Display a Buffer"
 sidebarTitle: "Quickstart"
-description: "Learn how to allocate a GPU buffer with gbm.rs, write pixel data to it, and display it on screen using DRM/KMS in five steps."
+description: "Learn how to open a DRM device, allocate a GPU buffer with gbm.rs, write pixel data to it, and display it on screen using DRM/KMS in five steps."
 ---
 
 This guide walks you through the complete path from opening a DRM device to displaying a GPU-allocated buffer on a connected monitor. You will open `/dev/dri/card0`, wrap it in a GBM device, allocate a 1280×720 scanout buffer, fill it with pixel data from the CPU, and hand it to the DRM/KMS subsystem as a framebuffer. The full example requires the default feature set (`drm-support`, `import-wayland`, `import-egl`). Add gbm.rs and drm-rs to your `Cargo.toml` before running this code.

@@ -1,7 +1,7 @@
 ---
-title: "Pixel Formats and DRM Modifiers in gbm.rs"
+title: "DRM Pixel Formats and Memory Tiling Modifiers in gbm.rs"
 sidebarTitle: "Formats & Modifiers"
-description: "gbm.rs uses DRM FourCC pixel formats and format modifiers to describe buffer layout. Learn which formats to use for scanout, rendering, and multi-plane buffers."
+description: "gbm.rs uses DRM FourCC formats and modifiers to describe buffer layout. Learn which formats suit scanout, rendering, and multi-plane buffer allocation."
 ---
 
 gbm.rs re-exports two types from the [`drm-fourcc`](https://crates.io/crates/drm-fourcc) crate that describe how pixel data is stored in a `BufferObject` or `Surface`: `Format` (an alias for `DrmFourcc`) and `Modifier` (an alias for `DrmModifier`). Every allocation API in gbm.rs requires a `Format`, and the modifier-based APIs additionally accept a list of `Modifier` values to negotiate the optimal buffer layout with the GPU driver.

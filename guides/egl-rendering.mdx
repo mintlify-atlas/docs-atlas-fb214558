@@ -1,5 +1,5 @@
 ---
-title: "EGL Rendering with GBM Surfaces on DRM"
+title: "GPU Rendering with GBM Surfaces and EGL on Bare-Metal DRM"
 sidebarTitle: "EGL Rendering"
 description: "Set up GBM surfaces as native window types for EGL, render with OpenGL ES, and present frames to the display using the GBM front buffer protocol."
 ---
@@ -58,7 +58,7 @@ drm = "0.14"
     ```
 
     <Note>
-      `as_raw()` returns a `*const gbm_surface`. Most EGL bindings expect a `*mut c_void`; a double cast through `as_raw_mut()` (also provided by `AsRaw`) or a `as *mut _` coercion is safe here because EGL only reads the pointer value — it does not mutate through it.
+      `as_raw()` returns a `*const gbm_surface`. Most EGL bindings expect a `*mut c_void`; cast with `as *mut _` — this is safe because EGL only reads the pointer value and does not mutate through it.
     </Note>
   </Step>
 

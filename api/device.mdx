@@ -1,7 +1,7 @@
 ---
-title: "Device<T> - GBM Device Type Reference"
+title: "Device<T> - GBM Device Struct and Trait Implementations"
 sidebarTitle: "Device"
-description: "API reference for Device<T>, the root type in gbm.rs. Wraps a DRM file descriptor to provide buffer allocation, surface creation, and buffer import methods."
+description: "API reference for Device<T>, the root gbm.rs type. Wraps a DRM file descriptor and owns the gbm_device lifetime for buffer allocation and surface creation."
 ---
 
 `Device<T>` is the entry point for all gbm.rs operations. It wraps an open DRM file descriptor and owns the lifetime of the underlying `gbm_device`, providing methods to allocate buffer objects, create rendering surfaces, and import foreign buffers from Wayland, EGL, and DMA-BUF sources. Every other type in gbm.rs — `BufferObject<U>` and `Surface<U>` — is produced through a `Device<T>`.

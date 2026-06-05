@@ -1,7 +1,7 @@
 ---
 title: "Device<T> Methods - Buffer, Surface, and Import APIs"
 sidebarTitle: "Device Methods"
-description: "Complete method reference for Device<T> in gbm.rs: backend queries, buffer object creation with modifiers, surface creation, and buffer import from Wayland, EGL, and DMA-BUF."
+description: "All Device<T> methods in gbm.rs: backend queries, buffer object and surface creation with modifiers, and buffer import from Wayland, EGL, and DMA-BUF."
 ---
 
 This page documents every method on `Device<T>`, organized by category. Methods are grouped into four areas: backend queries (inspecting driver capabilities), buffer object creation (allocating GPU-visible memory), surface creation (allocating scanout-backed render targets), and buffer import (wrapping foreign buffers from Wayland, EGL, and DMA-BUF sources). For type-level documentation — struct definition, trait implementations, and the `Device::new` constructor — see [Device](/api/device).
@@ -132,7 +132,7 @@ let bo = device.create_buffer_object::<()>(
     Format::Xrgb8888,
     BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
 )?;
-println!("allocated {}x{} buffer", bo.width()?, bo.height()?);
+println!("allocated {}x{} buffer", bo.width(), bo.height());
 ```
 
 ---
